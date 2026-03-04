@@ -1,0 +1,49 @@
+﻿:root {
+  --bg-sand: #f6f1e8;
+  --bg-paper: #fffdf8;
+  --ink-900: #1f2933;
+  --ink-700: #364250;
+  --ink-500: #5e6b78;
+  --line: #d6d9df;
+  --accent-cyan: #0d9488;
+  --accent-orange: #ea580c;
+  --accent-yellow: #f59e0b;
+  --success: #15803d;
+  --danger: #b91c1c;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  min-height: 100%;
+  max-width: 100vw;
+  overflow-x: hidden;
+}
+
+body {
+  background:
+    radial-gradient(circle at 15% 10%, rgba(13, 148, 136, 0.16), transparent 35%),
+    radial-gradient(circle at 85% 0%, rgba(234, 88, 12, 0.16), transparent 30%),
+    linear-gradient(180deg, var(--bg-sand) 0%, #efe6d6 100%);
+  color: var(--ink-900);
+  font-family: var(--font-space-grotesk), "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}

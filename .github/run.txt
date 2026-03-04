@@ -1,0 +1,128 @@
+Tekno Phantom Agent - Run Commands (Windows / PowerShell)
+=========================================================
+
+Current local setup in this repo:
+- Brain:   http://127.0.0.1:8090
+- Backend: http://127.0.0.1:8081
+- Frontend http://localhost:3000
+- Model:   Ollama (qwen2.5:3b)
+
+IMPORTANT
+- Keep each service in its own terminal window.
+- Start in this order: Ollama -> Brain -> Backend -> Frontend.
+- For Playwright mode on Windows, run backend WITHOUT --reload.
+
+
+1) Terminal A - Ollama check/start
+----------------------------------
+# If Ollama app/service is already running, this is enough:
+ollama list
+
+# If needed, pull model once:
+ollama pull qwen2.5:3b
+
+# Optional manual serve (usually not required on Windows app install):
+# ollama serve
+
+
+2) Terminal B - Brain service (port 8090)
+------------------------------------------
+cd "C:\Users\Teknotrait Solutions\Desktop\Tekno-Phatom-agent\brain"
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8090
+
+
+3) Terminal C - Backend service (port 8081)
+--------------------------------------------
+cd "C:\Users\Teknotrait Solutions\Desktop\Tekno-Phatom-agent\backend"
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8081
+
+# Optional: enable real File MCP integration (recommended for requirement coverage)
+# set FILESYSTEM_MODE=mcp
+# then start backend in the same terminal
+
+
+4) Terminal D - Frontend (port 3000)
+-------------------------------------
+cd "C:\Users\Teknotrait Solutions\Desktop\Tekno-Phatom-agent\frontend"
+npm.cmd run dev
+
+Open in browser:
+http://localhost:3000
+
+
+5) Health checks (from any PowerShell terminal)
+------------------------------------------------
+Invoke-RestMethod http://127.0.0.1:8090/health
+Invoke-RestMethod http://127.0.0.1:8081/health
+Invoke-RestMethod http://127.0.0.1:8081/api/config
+
+Expected:
+- brain: status=ok, mode=local, model=qwen2.5:3b
+- backend: status=ok, llm_mode=local, model=qwen2.5:3b, browser_mode=playwright
+
+# Optional strict Browser MCP mode:
+# BROWSER_MODE=mcp
+# BROWSER_MCP_COMMAND=npx
+# BROWSER_MCP_PACKAGE=@playwright/mcp@latest
+
+
+6) If frontend shows "Failed to fetch"
+---------------------------------------
+Check this file:
+frontend\.env.local
+
+It must contain:
+NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8081
+
+After changing .env.local, restart frontend terminal (npm.cmd run dev).
+
+
+7) Stop services
+----------------
+- In each running terminal, press: Ctrl + C
+
+
+8) One-time install commands (if new machine or fresh venv)
+------------------------------------------------------------
+# brain
+cd "C:\Users\Teknotrait Solutions\Desktop\Tekno-Phatom-agent\brain"
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+
+# backend
+cd "C:\Users\Teknotrait Solutions\Desktop\Tekno-Phatom-agent\backend"
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m playwright install chromium
+
+# frontend
+cd "C:\Users\Teknotrait Solutions\Desktop\Tekno-Phatom-agent\frontend"
+npm.cmd install
+
+
+9) Notes
+--------
+- backend uses SQLite persistence now:
+  RUN_STORE_BACKEND=sqlite
+  RUN_STORE_DB_PATH=data/run_store.sqlite3
+- backend supports File MCP mode:
+  FILESYSTEM_MODE=mcp
+  FILE_MCP_COMMAND=npx
+  FILE_MCP_PACKAGE=@modelcontextprotocol/server-filesystem
+- optional admin token protection:
+  ADMIN_API_TOKEN=your_secret_token
+  frontend\.env.local -> NEXT_PUBLIC_ADMIN_API_TOKEN=your_secret_token
+- If you change backend port later, update frontend\.env.local accordingly.
+
+
+10) Automated regression tests (backend)
+----------------------------------------
+cd "C:\Users\Teknotrait Solutions\Desktop\Tekno-Phatom-agent\backend"
+.\.venv\Scripts\python.exe -m pip install -e .[dev]
+.\.venv\Scripts\python.exe -m pytest -q
+
+Expected:
+- All backend tests pass.
+- Includes step-matrix integration test:
+  navigate, wait, type, select, scroll, handle_popup, verify_text, verify_image, click
+- Includes selenium-style smoke flow test.

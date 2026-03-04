@@ -1,0 +1,64 @@
+TEKNO PHANTOM AGENT - RUN COMMANDS (WINDOWS)
+============================================
+
+Open 3 terminals and run each service separately.
+
+1) BRAIN (LLM service)
+----------------------
+PowerShell:
+cd "C:\Users\Teknotrait Solutions\Desktop\Tekno-Phatom-agent\brain"
+if (!(Test-Path .venv)) { python -m venv .venv }
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8090
+
+CMD:
+cd /d "C:\Users\Teknotrait Solutions\Desktop\Tekno-Phatom-agent\brain"
+if not exist .venv python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8090
+
+Health check:
+http://127.0.0.1:8090/health
+
+
+2) BACKEND (orchestrator + APIs)
+--------------------------------
+PowerShell:
+cd "C:\Users\Teknotrait Solutions\Desktop\Tekno-Phatom-agent\backend"
+if (!(Test-Path .venv)) { python -m venv .venv }
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8080
+
+CMD:
+cd /d "C:\Users\Teknotrait Solutions\Desktop\Tekno-Phatom-agent\backend"
+if not exist .venv python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8080
+
+Health/config:
+http://127.0.0.1:8080/health
+http://127.0.0.1:8080/api/config
+
+
+3) FRONTEND (UI)
+----------------
+PowerShell:
+cd "C:\Users\Teknotrait Solutions\Desktop\Tekno-Phatom-agent\frontend"
+npm.cmd install
+npm.cmd run dev
+
+CMD:
+cd /d "C:\Users\Teknotrait Solutions\Desktop\Tekno-Phatom-agent\frontend"
+npm install
+npm run dev
+
+UI:
+http://localhost:3000
+
+
+QUICK VERIFY
+------------
+1. Brain health is OK at 8090.
+2. Backend config loads at 8080.
+3. Frontend opens at 3000.
+4. Run one prompt and confirm step statuses update.
