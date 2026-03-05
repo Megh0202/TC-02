@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Annotated
 
@@ -33,6 +35,13 @@ from app.schemas import (
 )
 
 LOGGER = logging.getLogger("tekno.phantom.api")
+
+# Playwright requires subprocess support; on Windows this must be Proactor loop.
+if sys.platform.startswith("win"):
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
 
 
 def _extract_bearer_token(authorization: str | None) -> str | None:
@@ -154,6 +163,49 @@ def _ensure_drag_step(task: str, steps: list[dict[str, object]]) -> list[dict[st
     return ensured
 
 
+def _expand_drag_steps(
+    steps: list[dict[str, object]],
+    *,
+    max_steps: int,
+) -> list[dict[str, object]]:
+    """
+    Expand each drag step into explicit actions so runtime and UI show:
+    click(select) -> drag -> wait(drop-settle).
+    """
+    expanded: list[dict[str, object]] = []
+
+    for step in steps:
+        if len(expanded) >= max_steps:
+            break
+
+        if str(step.get("type", "")).lower() != "drag":
+            expanded.append(dict(step))
+            continue
+
+        source_selector = str(step.get("source_selector") or "").strip()
+        if not source_selector:
+            expanded.append(dict(step))
+            continue
+
+        prev = expanded[-1] if expanded else None
+        prev_is_same_click = bool(
+            prev
+            and str(prev.get("type", "")).lower() == "click"
+            and str(prev.get("selector") or "").strip() == source_selector
+        )
+
+        if not prev_is_same_click and len(expanded) < max_steps:
+            expanded.append({"type": "click", "selector": source_selector})
+
+        if len(expanded) < max_steps:
+            expanded.append(dict(step))
+
+        if len(expanded) < max_steps:
+            expanded.append({"type": "wait", "until": "timeout", "ms": 220})
+
+    return expanded[:max_steps]
+
+
 def build_admin_auth_dependency(settings: Settings):
     async def require_admin_auth(
         authorization: Annotated[str | None, Header(alias="Authorization")] = None,
@@ -235,13 +287,25 @@ def build_app() -> FastAPI:
         background_tasks: BackgroundTasks,
         _: None = Depends(require_admin_auth),
     ) -> RunState:
-        if len(request.steps) > settings.max_steps_per_run:
+        raw_steps = [step.model_dump(exclude_none=True) for step in request.steps]
+        expanded_steps = _expand_drag_steps(raw_steps, max_steps=settings.max_steps_per_run)
+        expanded_request = RunCreateRequest.model_validate(
+            {
+                "run_name": request.run_name,
+                "start_url": request.start_url,
+                "steps": expanded_steps,
+                "test_data": request.test_data,
+                "selector_profile": request.selector_profile,
+            }
+        )
+
+        if len(expanded_request.steps) > settings.max_steps_per_run:
             raise HTTPException(
                 status_code=400,
                 detail=f"Step count exceeds max_steps_per_run={settings.max_steps_per_run}",
             )
 
-        run = run_store.create(request)
+        run = run_store.create(expanded_request)
         background_tasks.add_task(executor.execute, run.run_id)
         LOGGER.info("Run created: %s", run.run_id)
         return run
@@ -279,6 +343,7 @@ def build_app() -> FastAPI:
             raw_steps,
             max_steps=max(len(raw_steps), settings.max_steps_per_run, 1),
         )
+        normalized_steps = _expand_drag_steps(normalized_steps, max_steps=settings.max_steps_per_run)
         if not normalized_steps:
             raise HTTPException(
                 status_code=422,
@@ -352,7 +417,20 @@ def build_app() -> FastAPI:
                 "selector_profile": test_case.selector_profile,
             }
         )
-        run = run_store.create(run_request)
+        expanded_steps = _expand_drag_steps(
+            [step.model_dump(exclude_none=True) for step in run_request.steps],
+            max_steps=settings.max_steps_per_run,
+        )
+        expanded_run_request = RunCreateRequest.model_validate(
+            {
+                "run_name": run_request.run_name,
+                "start_url": run_request.start_url,
+                "steps": expanded_steps,
+                "test_data": run_request.test_data,
+                "selector_profile": run_request.selector_profile,
+            }
+        )
+        run = run_store.create(expanded_run_request)
         background_tasks.add_task(executor.execute, run.run_id)
         LOGGER.info("Run created from test case: %s (test_case_id=%s)", run.run_id, test_case_id)
         return run
@@ -425,6 +503,7 @@ def build_app() -> FastAPI:
             normalized_steps = normalize_plan_steps(payload.get("steps"), max_steps=max_steps)
             normalized_steps = _sanitize_plan_steps(normalized_steps, start_url=payload.get("start_url"))
             normalized_steps = _ensure_drag_step(request.task, normalized_steps)
+            normalized_steps = _expand_drag_steps(normalized_steps, max_steps=max_steps)
             if not normalized_steps:
                 normalized_steps = build_recovery_steps(request.task, max_steps=max_steps)
             if not normalized_steps:

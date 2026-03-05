@@ -49,6 +49,11 @@ DEFAULT_SELECTOR_PROFILE: dict[str, list[str]] = {
         "button:has-text('Create Form')",
         "[role='button']:has-text('Create Form')",
     ],
+    "create_form_confirm": [
+        "[role='dialog'] button:has-text('Create')",
+        "div[role='dialog'] button:has-text('Create')",
+        "button:has-text('Create')",
+    ],
     "form_name": [
         "input[name='formName']",
         "input[name='name']",
@@ -60,6 +65,9 @@ DEFAULT_SELECTOR_PROFILE: dict[str, list[str]] = {
         "textarea[name='name']",
     ],
     "save_form": [
+        "div[role='dialog'] button:has-text('Save')",
+        "div[role='dialog'] [role='button']:has-text('Save')",
+        "div[role='dialog'] button[type='submit']",
         "button#saveForm",
         "button.save-form",
         "button:has-text('Save')",
@@ -72,9 +80,22 @@ DEFAULT_SELECTOR_PROFILE: dict[str, list[str]] = {
         "[draggable='true'][aria-label*='Short answer']",
         "[draggable='true']:has-text('Short answer')",
         "[role='listitem']:has-text('Short answer')",
+        "button:has-text('Short answer')",
+        "[role='button']:has-text('Short answer')",
         "text=Short answer",
     ],
+    "email_field_source": [
+        "[data-testid='field-email']",
+        "[data-testid*='field-email']",
+        "[data-rbd-draggable-id*='email']",
+        "[draggable='true'][aria-label*='Email']",
+        "[draggable='true']:has-text('Email')",
+        "[role='listitem']:has-text('Email')",
+        "text=Email",
+    ],
     "form_canvas_target": [
+        "div.form-row[draggable='true']:has-text('Drag and drop fields here')",
+        "div.form-row.relative.flex.w-full[draggable='true']:has-text('Drag and drop fields here')",
         "[data-testid='form-builder-canvas']",
         "[data-testid*='form-builder'][class*='canvas']",
         ".form-builder-canvas",
@@ -85,9 +106,16 @@ DEFAULT_SELECTOR_PROFILE: dict[str, list[str]] = {
         "[data-testid='form-canvas']",
         "[class*='drop'][class*='canvas']",
         "[class*='builder'][class*='canvas']",
+        "div:has-text('Drag and drop fields here')",
+        "section:has-text('Drag and drop fields here')",
         "[role='application']",
     ],
     "form_label": [
+        "div[role='dialog'] input[placeholder='Enter a label']",
+        "div[role='dialog'] input[name='label']",
+        "div[role='dialog'] input[aria-label*='Label']",
+        "div[role='dialog'] textarea[placeholder='Enter a label']",
+        "div[role='dialog'] textarea[name='label']",
         "[data-testid='form-builder-canvas'] input[placeholder='Label']",
         "[data-testid='form-builder-canvas'] textarea[placeholder='Label']",
         "[data-testid='form-builder-canvas'] input[name='label']",
@@ -106,9 +134,14 @@ DEFAULT_SELECTOR_PROFILE: dict[str, list[str]] = {
         "[role='textbox'][aria-label*='Label']",
     ],
     "required_checkbox": [
+        "div[role='dialog'] label:has-text('Required')",
+        "div[role='dialog'] label:has-text('Required') input[type='checkbox']",
+        "div[role='dialog'] input[type='checkbox'][name='required']",
+        "div[role='dialog'] [role='checkbox'][aria-label*='Required']",
         "input[name='required']",
         "input[type='checkbox'][name='required']",
         "[data-testid='required'] input[type='checkbox']",
+        "label:has-text('Required')",
         "label:has-text('Required') input[type='checkbox']",
         "text=Required",
     ],
@@ -230,7 +263,11 @@ class AgentExecutor:
             )
         except Exception as exc:
             step.status = StepStatus.failed
-            step.error = str(exc)
+            compact = self._compact_error(exc)
+            if isinstance(exc, TimeoutError):
+                step.error = f"{compact} (step_type={step.type})"
+            else:
+                step.error = compact
             step.message = "Step failed"
         finally:
             step.ended_at = utc_now()
@@ -293,12 +330,16 @@ class AgentExecutor:
         if step_type == "drag":
             source_selector = str(raw_step["source_selector"])
             target_selector = str(raw_step["target_selector"])
+            target_offset_x = raw_step.get("target_offset_x")
+            target_offset_y = raw_step.get("target_offset_y")
             return await self._run_with_drag_fallback(
                 raw_source_selector=source_selector,
                 raw_target_selector=target_selector,
                 selector_profile=selector_profile,
                 test_data=test_data,
                 run_domain=run_domain,
+                target_offset_x=int(target_offset_x) if target_offset_x is not None else None,
+                target_offset_y=int(target_offset_y) if target_offset_y is not None else None,
             )
 
         if step_type == "scroll":
@@ -583,6 +624,8 @@ class AgentExecutor:
                 for token in ("short answer", "short_answer", "shortanswer", "draggable")
             ):
                 keys.insert(0, "short_answer_source")
+            if any(token in selector_lower for token in ("email", "field-email")):
+                keys.insert(0, "email_field_source")
             if any(
                 token in selector_lower
                 for token in ("canvas", "dropzone", "drop zone", "form-canvas", "form builder")
@@ -614,7 +657,73 @@ class AgentExecutor:
             candidates.append(selector)
             candidates.extend(self._derive_selector_variants(selector, step_type))
 
-        return self._dedupe(candidates)
+        deduped = self._dedupe(candidates)
+        if step_type == "drag":
+            deduped = self._prioritize_drag_candidates(deduped, alias_key=alias_key)
+        if alias_key:
+            deduped = self._filter_alias_candidates(alias_key, deduped)
+        return deduped
+
+    @staticmethod
+    def _prioritize_drag_candidates(candidates: list[str], alias_key: str | None) -> list[str]:
+        key = (alias_key or "").strip().lower()
+
+        def score(selector: str) -> int:
+            s = selector.lower()
+            value = 100
+            if key == "short_answer_source":
+                if "[data-testid='field-short-answer']" in s:
+                    value -= 90
+                if "[data-testid*='short-answer']" in s:
+                    value -= 82
+                if "[data-rbd-draggable-id*='short']" in s:
+                    value -= 78
+                if "[draggable='true']" in s:
+                    value -= 75
+                if "[role='listitem']" in s:
+                    value -= 60
+                if "button:has-text('short answer')" in s or "[role='button']:has-text('short answer')" in s:
+                    value -= 35
+                if "text=short answer" in s:
+                    value -= 25
+            if key == "form_canvas_target":
+                if "[data-testid='form-builder-canvas']" in s:
+                    value -= 85
+                if ".form-canvas" in s or ".form-drop-area" in s or ".form-builder-canvas" in s:
+                    value -= 70
+                if "[data-testid='form-canvas']" in s or "[class*='drop'][class*='canvas']" in s:
+                    value -= 55
+                if "drag and drop fields here" in s:
+                    value -= 25
+                if "[role='application']" in s:
+                    value += 25
+            return value
+
+        return sorted(candidates, key=score)
+
+    def _filter_alias_candidates(self, alias_key: str, candidates: list[str]) -> list[str]:
+        key = alias_key.strip().lower()
+        if key != "form_label":
+            return candidates
+
+        blocked_tokens = (
+            "#formname",
+            "input#formname",
+            "input[name='formname']",
+            "input[name='name']",
+            "textarea[name='name']",
+            "placeholder*='name'",
+            "placeholder=\"name\"",
+            "placeholder='name'",
+            "input[type='text']",
+        )
+
+        filtered = [
+            candidate
+            for candidate in candidates
+            if not any(token in candidate.lower() for token in blocked_tokens)
+        ]
+        return filtered or candidates
 
     async def _run_with_drag_fallback(
         self,
@@ -624,6 +733,8 @@ class AgentExecutor:
         selector_profile: dict[str, list[str]],
         test_data: dict[str, Any],
         run_domain: str | None,
+        target_offset_x: int | None = None,
+        target_offset_y: int | None = None,
     ) -> str:
         source_candidates = self._selector_candidates(
             raw_source_selector,
@@ -646,16 +757,102 @@ class AgentExecutor:
 
         last_error: Exception | None = None
         attempts: list[str] = []
-        pair_count = max(len(source_candidates) * len(target_candidates), 1)
-        pair_timeout_s = self._candidate_timeout_seconds(pair_count)
-        recovery_attempts = self._selector_recovery_attempts()
+        source_base = source_candidates[:6]
+        target_base = target_candidates[:5]
+
+        source_text_candidate = next((candidate for candidate in source_candidates if candidate.startswith("text=")), None)
+        target_placeholder_candidate = next(
+            (candidate for candidate in target_candidates if "Drag and drop fields here" in candidate),
+            None,
+        )
+
+        source_pool = list(source_base)
+        target_pool = list(target_base)
+        if source_text_candidate and source_text_candidate not in source_pool:
+            source_pool.append(source_text_candidate)
+        if target_placeholder_candidate and target_placeholder_candidate not in target_pool:
+            target_pool.append(target_placeholder_candidate)
+        primary_targets = target_pool[:2] if len(target_pool) >= 2 else target_pool
+        pair_set: set[tuple[str, str]] = set()
+        pairs: list[tuple[str, str]] = []
+
+        # Phase 1: quickly validate multiple source candidates against primary targets.
+        for source_selector in source_pool:
+            for target_selector in primary_targets:
+                pair = (source_selector, target_selector)
+                if pair in pair_set:
+                    continue
+                pair_set.add(pair)
+                pairs.append(pair)
+                if len(pairs) >= 6:
+                    break
+            if len(pairs) >= 6:
+                break
+
+        # Phase 2: then widen to more combinations.
+        if len(pairs) < 6:
+            for source_selector in source_pool:
+                for target_selector in target_pool:
+                    pair = (source_selector, target_selector)
+                    if pair in pair_set:
+                        continue
+                    pair_set.add(pair)
+                    pairs.append(pair)
+                    if len(pairs) >= 6:
+                        break
+                if len(pairs) >= 6:
+                    break
+
+        if not pairs:
+            raise ValueError("No drag selector pairs available")
+
+        # VitaOne builder drag is sensitive; repeated multi-pair retries can cause
+        # duplicate drag actions even after a successful visual drop.
+        if run_domain and "vitaone.io" in run_domain.lower():
+            pairs = pairs[:1]
+
+        recovery_attempts = max(1, min(self._selector_recovery_attempts(), 2))
+        if run_domain and "vitaone.io" in run_domain.lower():
+            recovery_attempts = 1
+        step_timeout = max(float(getattr(self._settings, "step_timeout_seconds", 60)), 5.0)
+        # Drag/drop UIs often need a longer interaction window than click/type.
+        step_budget_s = max(20.0, step_timeout * 0.90)
+        # Drag adapters already perform internal multi-strategy retries; give each
+        # selector pair more time instead of spreading time across many pairs.
+        effective_pair_budget = max(min(len(pairs), 2) * recovery_attempts, 1)
+        pair_timeout_s = min(35.0, max(15.0, step_budget_s / effective_pair_budget))
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        budget_exhausted = False
 
         for cycle in range(recovery_attempts):
-            for source_selector in source_candidates:
-                for target_selector in target_candidates:
+            for source_selector, target_selector in pairs:
+                    elapsed = loop.time() - started_at
+                    if elapsed >= step_budget_s:
+                        last_error = TimeoutError(
+                            f"drag budget exceeded after {elapsed:.1f}s "
+                            f"(pairs={len(pairs)}, attempts={len(attempts)})"
+                        )
+                        budget_exhausted = True
+                        break
                     try:
+                        async def _invoke_drag() -> str:
+                            try:
+                                return await self._browser.drag_and_drop(
+                                    source_selector,
+                                    target_selector,
+                                    target_offset_x=target_offset_x,
+                                    target_offset_y=target_offset_y,
+                                )
+                            except TypeError as te:
+                                # Backward compatibility for test doubles / older adapters.
+                                message = str(te)
+                                if "unexpected keyword argument" not in message:
+                                    raise
+                                return await self._browser.drag_and_drop(source_selector, target_selector)
+
                         result = await asyncio.wait_for(
-                            self._browser.drag_and_drop(source_selector, target_selector),
+                            _invoke_drag(),
                             timeout=pair_timeout_s,
                         )
                         self._remember_selector_success(
@@ -676,32 +873,18 @@ class AgentExecutor:
                     except Exception as exc:
                         last_error = exc
                         attempts.append(
-                            f"pass {cycle + 1}: {source_selector} -> {target_selector} -> {self._compact_error(exc)}"
+                            "pass "
+                            f"{cycle + 1}: {source_selector} -> {target_selector} "
+                            f"(offset={target_offset_x},{target_offset_y}) -> {self._compact_error(exc)}"
                         )
+            if budget_exhausted:
+                break
 
             if cycle >= recovery_attempts - 1:
                 break
             if not self._should_retry_selector_error(last_error):
                 break
             await self._selector_recovery_pause()
-
-        # Fallback for UIs where clicking the field chip inserts it into canvas.
-        for source_selector in source_candidates:
-            try:
-                click_result = await asyncio.wait_for(
-                    self._browser.click(source_selector),
-                    timeout=self._candidate_timeout_seconds(len(source_candidates)),
-                )
-                self._remember_selector_success(
-                    run_domain=run_domain,
-                    step_type="drag",
-                    raw_selector=raw_source_selector,
-                    resolved_selector=source_selector,
-                    text_hint=None,
-                )
-                return f"{click_result} (drag fallback)"
-            except Exception:
-                continue
 
         if last_error:
             attempted = "; ".join(attempts[:8])
@@ -944,6 +1127,10 @@ class AgentExecutor:
     def _compact_error(exc: Exception) -> str:
         text = str(exc).strip().replace("\r", " ").replace("\n", " ")
         text = re.sub(r"\s+", " ", text)
+        if not text:
+            text = repr(exc)
+        if text in {"Exception()", "RuntimeError()", "ValueError()", "TimeoutError()"}:
+            text = f"{type(exc).__name__}: {repr(exc)}"
         if len(text) > 220:
             return f"{text[:217]}..."
         return text
@@ -1014,6 +1201,8 @@ class AgentExecutor:
                 for token in ("short answer", "short_answer", "shortanswer", "draggable")
             ):
                 keys.append("short_answer_source")
+            if any(token in selector_lower for token in ("email", "field-email")):
+                keys.append("email_field_source")
             if any(
                 token in selector_lower
                 for token in ("canvas", "dropzone", "drop zone", "form-canvas", "form builder")

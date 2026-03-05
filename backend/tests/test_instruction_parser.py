@@ -22,3 +22,26 @@ def test_structured_prompt_inserts_login_before_create_form_verify() -> None:
     assert any(step.get("selector") == "{{selector.create_form}}" for step in steps if step["type"] in {"click", "verify_text"})
     assert any(step.get("selector") == "{{selector.save_form}}" for step in steps if step["type"] == "click")
 
+
+def test_structured_prompt_inserts_create_click_after_form_name_before_drag() -> None:
+    task = """
+1) Navigate to https://test.vitaone.io
+2) Type "qa@example.com" into email field
+3) Type "secret123" into password field
+4) Click "Create Form"
+5) In Form Name, type QA_Form_{{NOW_YYYYMMDD_HHMMSS}}
+6) Drag "Short answer" field into the form canvas
+7) In label input, type "First Name"
+8) Check the "Required" checkbox
+"""
+    steps = parse_structured_task_steps(task, max_steps=20)
+
+    form_name_index = next(
+        i for i, step in enumerate(steps)
+        if step.get("type") == "type" and step.get("selector") == "{{selector.form_name}}"
+    )
+
+    assert steps[form_name_index + 1]["type"] == "click"
+    assert steps[form_name_index + 1]["selector"] == "{{selector.create_form_confirm}}"
+    assert steps[form_name_index + 2]["type"] == "wait"
+    assert steps[form_name_index + 3]["type"] == "drag"

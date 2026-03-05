@@ -55,6 +55,8 @@ class DragStep(BaseModel):
     type: Literal["drag"]
     source_selector: str
     target_selector: str
+    target_offset_x: int | None = None
+    target_offset_y: int | None = None
 
 
 class ScrollStep(BaseModel):

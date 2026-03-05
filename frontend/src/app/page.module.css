@@ -406,6 +406,8 @@
 .errorText {
   color: #991b1b;
   font-size: 14px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .infoText {

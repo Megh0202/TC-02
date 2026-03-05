@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     playwright_headless: bool = True
     playwright_default_timeout_ms: int = 15000
     playwright_slow_mo_ms: int = 0
+    drag_use_fixed_coords: bool = True
+    drag_target_x_offset: int = 260
+    drag_target_y_offset: int = 180
+    drag_retry_radius_px: int = 40
+    drag_validation_wait_ms: int = 300
+    drag_mouse_steps: int = 24
     browser_mcp_command: str = "npx"
     browser_mcp_package: str = "@playwright/mcp@latest"
     browser_mcp_npx_yes: bool = True

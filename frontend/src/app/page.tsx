@@ -872,7 +872,15 @@ export default function Home() {
                       </p>
                     </div>
                     {step.message ? <p className={styles.stepMessage}>{step.message}</p> : null}
-                    {step.error ? <p className={styles.stepError}>{step.error}</p> : null}
+                    {step.error ? (
+                      <p className={styles.stepError}>{step.error}</p>
+                    ) : step.status === "failed" ? (
+                      <p className={styles.stepError}>
+                        Step failed with no details returned. Re-run once and check backend logs with Run ID:
+                        {" "}
+                        {currentRun.run_id}
+                      </p>
+                    ) : null}
                   </article>
                 ))}
               </div>

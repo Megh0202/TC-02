@@ -97,11 +97,28 @@ def _normalize_step(raw_step: dict[str, Any]) -> dict[str, Any] | None:
         target_selector = _pick_drag_target_selector(raw_step)
         if not source_selector or not target_selector:
             return None
-        return {
+        step: dict[str, Any] = {
             "type": "drag",
             "source_selector": source_selector,
             "target_selector": target_selector,
         }
+        target_offset_x = (
+            _to_int(raw_step.get("target_offset_x"))
+            or _to_int(raw_step.get("drop_offset_x"))
+            or _to_int(raw_step.get("target_x"))
+            or _to_int(raw_step.get("drop_x"))
+        )
+        target_offset_y = (
+            _to_int(raw_step.get("target_offset_y"))
+            or _to_int(raw_step.get("drop_offset_y"))
+            or _to_int(raw_step.get("target_y"))
+            or _to_int(raw_step.get("drop_y"))
+        )
+        if target_offset_x is not None:
+            step["target_offset_x"] = target_offset_x
+        if target_offset_y is not None:
+            step["target_offset_y"] = target_offset_y
+        return step
 
     if step_type == "scroll":
         direction = _normalize_direction(raw_step.get("direction"), _get_step_type(raw_step))

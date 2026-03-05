@@ -28,6 +28,7 @@ def parse_structured_task_steps(task: str, max_steps: int) -> list[dict[str, Any
         if len(steps) >= max_steps:
             break
     steps = _enforce_login_sequence(steps, max_steps=max_steps)
+    steps = _enforce_form_create_sequence(steps, max_steps=max_steps)
     return steps[:max_steps]
 
 
@@ -79,10 +80,13 @@ def _parse_line(line: str) -> dict[str, Any] | None:
         value = _extract_form_name_value(line)
         return {"type": "type", "selector": "{{selector.form_name}}", "text": value, "clear_first": True}
 
-    if "drag" in lower and "short answer" in lower:
+    if "drag" in lower and any(token in lower for token in ("short answer", "email field", "email")):
+        source_alias = "{{selector.short_answer_source}}"
+        if "email" in lower and "short answer" not in lower:
+            source_alias = "{{selector.email_field_source}}"
         return {
             "type": "drag",
-            "source_selector": "{{selector.short_answer_source}}",
+            "source_selector": source_alias,
             "target_selector": "{{selector.form_canvas_target}}",
         }
 
@@ -178,4 +182,48 @@ def _enforce_login_sequence(steps: list[dict[str, Any]], max_steps: int) -> list
         {"type": "wait", "until": "timeout", "ms": 1200},
     ]
     merged = steps[: password_index + 1] + login_sequence + steps[password_index + 1 :]
+    return merged[:max_steps]
+
+
+def _enforce_form_create_sequence(steps: list[dict[str, Any]], max_steps: int) -> list[dict[str, Any]]:
+    """
+    Ensure we click "Create" after entering form name before builder interactions.
+    """
+    form_name_index = next(
+        (
+            idx
+            for idx, step in enumerate(steps)
+            if step.get("type") == "type" and str(step.get("selector", "")).strip() == "{{selector.form_name}}"
+        ),
+        None,
+    )
+    if form_name_index is None:
+        return steps
+
+    # If there is no builder work afterwards, do nothing.
+    has_builder_work_after = any(
+        (
+            step.get("type") == "drag"
+            or (step.get("type") == "type" and "form_label" in str(step.get("selector", "")))
+            or (step.get("type") == "click" and "required" in str(step.get("selector", "")).lower())
+        )
+        for step in steps[form_name_index + 1 :]
+    )
+    if not has_builder_work_after:
+        return steps
+
+    # If a create click already exists after form name typing, keep as-is.
+    has_create_click_after = any(
+        step.get("type") == "click"
+        and "create_form" in str(step.get("selector", "")).lower()
+        for step in steps[form_name_index + 1 :]
+    )
+    if has_create_click_after:
+        return steps
+
+    create_sequence = [
+        {"type": "click", "selector": "{{selector.create_form_confirm}}"},
+        {"type": "wait", "until": "timeout", "ms": 1000},
+    ]
+    merged = steps[: form_name_index + 1] + create_sequence + steps[form_name_index + 1 :]
     return merged[:max_steps]
