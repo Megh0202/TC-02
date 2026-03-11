@@ -13,7 +13,7 @@ class SummarizeResponse(BaseModel):
 
 class PlanRequest(BaseModel):
     task: str = Field(min_length=1, max_length=5000)
-    max_steps: int = Field(default=20, ge=1, le=50)
+    max_steps: int = Field(default=300, ge=1, le=500)
 
 
 class PlanResponse(BaseModel):

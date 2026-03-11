@@ -125,8 +125,8 @@ class RunCreateRequest(BaseModel):
     @field_validator("steps")
     @classmethod
     def validate_steps_length(cls, value: list[ActionStep]) -> list[ActionStep]:
-        if len(value) > 100:
-            raise ValueError("steps cannot exceed 100")
+        if len(value) > 500:
+            raise ValueError("steps cannot exceed 500")
         return value
 
     @field_validator("test_data", mode="before")
@@ -183,7 +183,7 @@ class RunCreateRequest(BaseModel):
 
 class PlanGenerateRequest(BaseModel):
     task: str = Field(min_length=1, max_length=5000)
-    max_steps: int | None = Field(default=None, ge=1, le=100)
+    max_steps: int | None = Field(default=None, ge=1, le=500)
     test_data: dict[str, JsonScalar] = Field(default_factory=dict)
     selector_profile: dict[str, list[str]] = Field(default_factory=dict)
 
@@ -226,8 +226,8 @@ class TestCaseCreateRequest(BaseModel):
     @field_validator("steps")
     @classmethod
     def validate_steps_length(cls, value: list[ActionStep]) -> list[ActionStep]:
-        if len(value) > 100:
-            raise ValueError("steps cannot exceed 100")
+        if len(value) > 500:
+            raise ValueError("steps cannot exceed 500")
         return value
 
     @field_validator("test_data", mode="before")

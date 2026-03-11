@@ -299,6 +299,41 @@ def test_selector_fallback_retries_transient_timeout_and_recovers() -> None:
     assert call_count == 2
 
 
+def test_email_candidates_exclude_password_selectors_from_memory() -> None:
+    executor = _executor()
+    memory = InMemorySelectorMemoryStore()
+    memory.remember_success("test.vitaone.io", "type", "email", "#password")
+    memory.remember_success("test.vitaone.io", "type", "email", "input[name='username']")
+    executor._selector_memory = memory
+
+    candidates = executor._selector_candidates(
+        raw_selector="email field",
+        step_type="type",
+        selector_profile={},
+        test_data={},
+        run_domain="test.vitaone.io",
+        text_hint="qa@example.com",
+    )
+
+    assert "#password" not in candidates
+    assert "input[name='username']" in candidates
+
+
+def test_password_value_with_at_symbol_does_not_trigger_email_candidates() -> None:
+    executor = _executor()
+    candidates = executor._selector_candidates(
+        raw_selector="password field",
+        step_type="type",
+        selector_profile={},
+        test_data={},
+        run_domain=None,
+        text_hint="PasswordVitaone1@",
+    )
+
+    assert "#password" in candidates
+    assert "#username" not in candidates
+
+
 def test_selector_fallback_does_not_retry_non_transient_error() -> None:
     executor = _executor(step_timeout_seconds=4)
     call_count = 0

@@ -41,8 +41,14 @@ def _extract_drag_label(selector: str) -> str | None:
     lower = text.lower()
     if "short-answer" in lower or "short answer" in lower or "field-short" in lower:
         return "Short answer"
+    if "field-dropdown" in lower or "linked dropdown" in lower or "dropdown" in lower:
+        return "Dropdown"
     if "field-email" in lower:
         return "Email"
+    if "aria-label" in lower and "email" in lower:
+        return "Email"
+    if "aria-label" in lower and "short" in lower:
+        return "Short answer"
     has_text = re.search(r":has-text\((['\"])(.*?)\1\)", text, re.IGNORECASE)
     if has_text and has_text.group(2).strip():
         return has_text.group(2).strip()
@@ -306,8 +312,15 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
             ".form-canvas input[placeholder='Label'], "
             ".form-canvas textarea[placeholder='Label']"
         )
+        canvas_rows = context.page.locator(
+            "[data-row-id].form-row[draggable='true'], "
+            "[data-testid='form-builder-canvas'] .form-row[draggable='true'], "
+            ".form-canvas .form-row[draggable='true'], "
+            ".form-drop-area .form-row[draggable='true']"
+        )
         had_placeholder = False
         before_inserted_count = 0
+        before_row_count = 0
         before_canvas_text = ""
         before_short_answer_in_canvas = 0
         try:
@@ -319,6 +332,10 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
         except Exception:
             before_inserted_count = 0
         try:
+            before_row_count = await canvas_rows.count()
+        except Exception:
+            before_row_count = 0
+        try:
             before_canvas_text = (await canvas_root.text_content() or "").strip()
         except Exception:
             before_canvas_text = ""
@@ -326,6 +343,12 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
             before_short_answer_in_canvas = await canvas_root.locator("text=Short answer").count()
         except Exception:
             before_short_answer_in_canvas = 0
+        try:
+            before_source_label_in_canvas = (
+                await canvas_root.locator(f"text={source_label}").count() if source_label else 0
+            )
+        except Exception:
+            before_source_label_in_canvas = 0
 
         source_label = _extract_drag_label(source_selector)
         if source_label:
@@ -362,21 +385,22 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
             pass
 
         quick_timeout_ms = min(max(self._settings.playwright_default_timeout_ms // 4, 900), 2200)
-        try:
-            if await source.count() == 0:
-                raise ValueError(f"Drag source not found: {source_selector}")
-            await source.wait_for(state="visible", timeout=quick_timeout_ms)
-            if await target.count() == 0:
-                raise ValueError(f"Drag target not found: {target_selector}")
-            await target.wait_for(state="visible", timeout=quick_timeout_ms)
-        except Exception as exc:
-            compact = str(exc).strip().replace("\r", " ").replace("\n", " ")
-            compact = re.sub(r"\s+", " ", compact)
-            if not compact:
-                compact = repr(exc)
-            raise ValueError(
-                f"Drag precheck failed for source={source_selector} target={target_selector}: {compact}"
-            ) from exc
+        if not is_vitaone:
+            try:
+                if await source.count() == 0:
+                    raise ValueError(f"Drag source not found: {source_selector}")
+                await source.wait_for(state="visible", timeout=quick_timeout_ms)
+                if await target.count() == 0:
+                    raise ValueError(f"Drag target not found: {target_selector}")
+                await target.wait_for(state="visible", timeout=quick_timeout_ms)
+            except Exception as exc:
+                compact = str(exc).strip().replace("\r", " ").replace("\n", " ")
+                compact = re.sub(r"\s+", " ", compact)
+                if not compact:
+                    compact = repr(exc)
+                raise ValueError(
+                    f"Drag precheck failed for source={source_selector} target={target_selector}: {compact}"
+                ) from exc
 
         async def _validate_drop_effect() -> None:
             await context.page.wait_for_timeout(max(self._settings.drag_validation_wait_ms, 100))
@@ -391,6 +415,10 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
             except Exception:
                 current_count = before_inserted_count
             try:
+                current_row_count = await canvas_rows.count()
+            except Exception:
+                current_row_count = before_row_count
+            try:
                 current_canvas_text = (await canvas_root.text_content() or "").strip()
             except Exception:
                 current_canvas_text = before_canvas_text
@@ -398,6 +426,12 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
                 current_short_answer_in_canvas = await canvas_root.locator("text=Short answer").count()
             except Exception:
                 current_short_answer_in_canvas = before_short_answer_in_canvas
+            try:
+                current_source_label_in_canvas = (
+                    await canvas_root.locator(f"text={source_label}").count() if source_label else 0
+                )
+            except Exception:
+                current_source_label_in_canvas = before_source_label_in_canvas
             try:
                 short_answer_modal_visible = await context.page.locator(
                     "div[role='dialog']:has-text('Short answer'), "
@@ -409,9 +443,13 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
 
             if had_placeholder and not placeholder_visible:
                 return
+            if current_row_count > before_row_count:
+                return
             if current_count > before_inserted_count:
                 return
             if is_vitaone and current_short_answer_in_canvas > before_short_answer_in_canvas:
+                return
+            if source_label and current_source_label_in_canvas > before_source_label_in_canvas:
                 return
             if is_vitaone and short_answer_modal_visible:
                 return
@@ -424,26 +462,44 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
         # Strategy 0: VitaOne pointer-driven drag (stable for the form builder canvas).
         if is_vitaone:
             try:
+                token = (source_label or "Short answer").strip()
+                token_l = token.lower()
+                key_token = token_l.split()[0] if token_l else "short"
                 vita_source_candidates = [
-                    context.page.locator("[data-testid='field-short-answer']").first,
-                    context.page.locator("[data-testid*='short-answer']").first,
-                    context.page.locator("[data-rbd-draggable-id*='short']").first,
-                    context.page.locator("[draggable='true']:has-text(\"Short answer\")").first,
-                    context.page.locator("button:has-text(\"Short answer\")").first,
+                    context.page.locator(f"[draggable='true']:has-text(\"{token}\")").first,
+                    context.page.locator(f"[role='listitem']:has-text(\"{token}\")").first,
+                    context.page.locator(f"[data-rbd-draggable-id*='{key_token}']").first,
+                    context.page.locator(f"[data-testid='field-{token_l.replace(' ', '-')}']").first,
+                    context.page.locator(f"[data-testid*='{token_l.replace(' ', '-')}']").first,
+                    context.page.locator(f"button:has-text(\"{token}\")").first,
+                    context.page.locator(f"[role='button']:has-text(\"{token}\")").first,
                     source,
                 ]
-                vita_target_candidates = [
+                vita_canvas_candidates = [
+                    context.page.locator("[data-row-id].form-row[draggable='true']").last,
+                    context.page.locator("[data-row-id]").last,
+                    context.page.locator("[data-testid='form-builder-canvas']").first,
+                    context.page.locator(".form-canvas").first,
+                    context.page.locator(".form-builder-canvas").first,
+                    context.page.locator(".form-drop-area").first,
+                    context.page.locator("[data-testid='form-builder-canvas'] .form-row[draggable='true']").last,
+                    context.page.locator(".form-canvas .form-row[draggable='true']").last,
+                    context.page.locator(".form-drop-area .form-row[draggable='true']").last,
                     context.page.locator("div.form-row[draggable='true']:has-text('Drag and drop fields here')").first,
                     context.page.locator("div.form-row.relative.flex.w-full[draggable='true']:has-text('Drag and drop fields here')").first,
                     canvas_root,
                     target,
                 ]
                 vita_target = target
-                for candidate in vita_target_candidates:
+                for candidate in vita_canvas_candidates:
                     try:
                         if await candidate.count() == 0:
                             continue
                         await candidate.wait_for(state="visible", timeout=1000)
+                        box = await candidate.bounding_box()
+                        if box and box["x"] > 250 and box["width"] > 220:
+                            vita_target = candidate
+                            break
                         vita_target = candidate
                         break
                     except Exception:
@@ -452,6 +508,18 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
                 target_box = await vita_target.bounding_box()
                 if not target_box:
                     raise ValueError("VitaOne canvas bounding box not found")
+                canvas_container = context.page.locator(
+                    "[data-testid='form-builder-canvas'], .form-canvas, .form-drop-area, .form-builder-canvas"
+                ).first
+                canvas_box = target_box
+                try:
+                    if await canvas_container.count() > 0:
+                        await canvas_container.wait_for(state="visible", timeout=1000)
+                        container_box = await canvas_container.bounding_box()
+                        if container_box:
+                            canvas_box = container_box
+                except Exception:
+                    pass
 
                 vita_source = source
                 for candidate in vita_source_candidates:
@@ -498,48 +566,128 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
                 sy = source_box["y"] + max(min(source_box["height"] * 0.50, source_box["height"] - 6), 6)
                 requested_x = int(target_offset_x) if target_offset_x is not None else 220
                 requested_y = int(target_offset_y) if target_offset_y is not None else 200
-                safe_x = min(max(requested_x, 120), max(int(target_box["width"]) - 120, 120))
-                safe_y = min(max(requested_y, 120), max(int(target_box["height"]) - 120, 120))
-                tx = target_box["x"] + safe_x
-                ty = target_box["y"] + safe_y
+                safe_x = min(max(requested_x, 120), max(int(canvas_box["width"]) - 120, 120))
+                safe_y = min(max(requested_y, 120), max(int(canvas_box["height"]) - 120, 120))
+                tx = canvas_box["x"] + safe_x
+                ty = canvas_box["y"] + safe_y
+                drop_points: list[tuple[float, float]] = [(tx, ty)]
 
-                await context.page.mouse.move(sx, sy)
-                await context.page.mouse.down()
-                await context.page.wait_for_timeout(120)
-                # Tiny move first to trigger drag start in builder DnD libs.
-                await context.page.mouse.move(sx + 18, sy + 4, steps=8)
-                await context.page.wait_for_timeout(40)
-                await context.page.mouse.move(tx, ty, steps=max(self._settings.drag_mouse_steps, 36))
-                await context.page.wait_for_timeout(120)
-                await context.page.mouse.up()
-
+                # Prefer dropping below the last existing builder row to avoid side-by-side placement.
                 try:
-                    await _validate_drop_effect()
+                    existing_rows = vita_target.locator(":scope .form-row[draggable='true']")
+                    if await existing_rows.count() == 0:
+                        existing_rows = context.page.locator(
+                            "[data-row-id].form-row[draggable='true'], "
+                            "[data-testid='form-builder-canvas'] .form-row[draggable='true'], "
+                            ".form-canvas .form-row[draggable='true'], "
+                            ".form-drop-area .form-row[draggable='true']"
+                        )
+                    row_count = await existing_rows.count()
+                    if row_count > 0:
+                        max_bottom = canvas_box["y"] + 80
+                        best_left = canvas_box["x"] + 140
+                        sample_limit = min(row_count, 15)
+                        for idx in range(sample_limit):
+                            try:
+                                row = existing_rows.nth(idx)
+                                row_text = ((await row.text_content()) or "").strip().lower()
+                                if "drag and drop fields here" in row_text:
+                                    continue
+                                row_box = await row.bounding_box()
+                                if not row_box:
+                                    continue
+                                row_bottom = row_box["y"] + row_box["height"]
+                                if row_bottom > max_bottom:
+                                    max_bottom = row_bottom
+                                    best_left = row_box["x"] + 40
+                                    # Keep latest row for alternate right-slot insertion point.
+                                    last_row_box = row_box
+                            except Exception:
+                                continue
+
+                        tx = min(
+                            max(best_left, canvas_box["x"] + 90),
+                            canvas_box["x"] + max(int(canvas_box["width"]) - 130, 130),
+                        )
+                        # Keep drop point inside canvas but below last row.
+                        canvas_top = canvas_box["y"] + 100
+                        canvas_bottom = canvas_box["y"] + max(canvas_box["height"] - 80, 180)
+                        desired = max_bottom + 56
+                        ty = min(max(desired, canvas_top), canvas_bottom)
+                        drop_points = [(tx, ty)]
+                        # Alternate: insert in same row right-side slot (works for some layouts).
+                        if "last_row_box" in locals():
+                            right_slot_x = min(
+                                max(last_row_box["x"] + (last_row_box["width"] * 0.78), canvas_box["x"] + 120),
+                                canvas_box["x"] + max(int(canvas_box["width"]) - 110, 110),
+                            )
+                            right_slot_y = min(
+                                max(last_row_box["y"] + (last_row_box["height"] * 0.52), canvas_box["y"] + 80),
+                                canvas_box["y"] + max(int(canvas_box["height"]) - 80, 160),
+                            )
+                            drop_points.insert(0, (right_slot_x, right_slot_y))
+                        # Alternate: center-below fallback.
+                        center_below_x = canvas_box["x"] + (canvas_box["width"] * 0.52)
+                        center_below_y = min(
+                            max(max_bottom + 64, canvas_box["y"] + 100),
+                            canvas_box["y"] + max(int(canvas_box["height"]) - 80, 160),
+                        )
+                        drop_points.append((center_below_x, center_below_y))
                 except Exception:
-                    # VitaOne sometimes applies drop but keeps placeholder DOM briefly.
-                    # Treat as success when we can detect any field editor controls.
-                    relaxed_hit = False
-                    relaxed_checks = [
-                        "[data-testid='form-builder-canvas'] input[placeholder='Label']",
-                        "[data-testid='form-builder-canvas'] textarea[placeholder='Label']",
-                        ".form-canvas input[placeholder='Label']",
-                        ".form-canvas textarea[placeholder='Label']",
-                        "[data-testid*='field-short-answer']",
-                        "[class*='field-short-answer']",
-                        "div[role='dialog']:has-text('Short answer')",
-                        "div[role='dialog'] input[placeholder='Enter a label']",
-                        "div[role='dialog'] button:has-text('Save')",
-                    ]
-                    for check_selector in relaxed_checks:
+                    pass
+
+                last_pointer_error: Exception | None = None
+                for dx, dy in drop_points[:4]:
+                    try:
+                        await context.page.mouse.move(sx, sy)
+                        await context.page.mouse.down()
+                        await context.page.wait_for_timeout(110)
+                        # Tiny move first to trigger drag start in builder DnD libs.
+                        await context.page.mouse.move(sx + 18, sy + 4, steps=8)
+                        await context.page.wait_for_timeout(30)
+                        await context.page.mouse.move(dx, dy, steps=max(self._settings.drag_mouse_steps, 34))
+                        await context.page.wait_for_timeout(100)
+                        await context.page.mouse.up()
+                        await _validate_drop_effect()
+                        return f"Dragged {source_selector} to {target_selector} (vitaone pointer drag)"
+                    except Exception as drag_try_exc:
+                        last_pointer_error = drag_try_exc
+                        # Ensure mouse is released before next attempt.
                         try:
-                            if await context.page.locator(check_selector).count() > 0:
-                                relaxed_hit = True
-                                break
+                            await context.page.mouse.up()
                         except Exception:
-                            continue
-                    if not relaxed_hit:
-                        raise
-                return f"Dragged {source_selector} to {target_selector} (vitaone pointer drag)"
+                            pass
+                        continue
+
+                # VitaOne sometimes applies drop but keeps placeholder DOM briefly.
+                # Treat as success when we can detect any field editor controls.
+                relaxed_hit = False
+                relaxed_checks = [
+                    "[data-testid='form-builder-canvas'] input[placeholder='Label']",
+                    "[data-testid='form-builder-canvas'] textarea[placeholder='Label']",
+                    ".form-canvas input[placeholder='Label']",
+                    ".form-canvas textarea[placeholder='Label']",
+                    "[data-testid*='field-short-answer']",
+                    "[class*='field-short-answer']",
+                    "[data-testid*='field-email']",
+                    "[class*='field-email']",
+                    "div[role='dialog']:has-text('Short answer')",
+                    "div[role='dialog']:has-text('Email')",
+                    "div[role='dialog'] input[placeholder='Enter a label']",
+                    "div[role='dialog'] button:has-text('Save')",
+                ]
+                for check_selector in relaxed_checks:
+                    try:
+                        if await context.page.locator(check_selector).count() > 0:
+                            relaxed_hit = True
+                            break
+                    except Exception:
+                        continue
+                if relaxed_hit:
+                    return f"Dragged {source_selector} to {target_selector} (vitaone pointer drag relaxed)"
+                if last_pointer_error:
+                    raise last_pointer_error
+                raise ValueError("VitaOne pointer drag failed: no valid drop point")
             except Exception:
                 pass
 
@@ -1042,14 +1190,19 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             f"  const source = page.locator({json.dumps(source_selector)}).first();"
             f"  const target = page.locator({json.dumps(target_selector)}).first();"
             f"  const sourceSelectorText = {json.dumps(source_selector)};"
+            "  const currentUrl = (typeof page.url === 'function' ? page.url() : '') || '';"
+            "  const isVitaOne = /vitaone\\.io/i.test(currentUrl);"
             "  const placeholder = page.locator('text=Drag and drop fields here').first();"
             "  const canvasRoot = page.locator(\"[data-testid='form-builder-canvas'], .form-canvas, .form-drop-area, .form-builder-canvas, section:has-text('Drag and drop fields here')\").first();"
             "  const insertedFields = page.locator(\"[data-testid='form-builder-canvas'] [data-testid*='field-'], [data-testid='form-builder-canvas'] input[placeholder='Label'], [data-testid='form-builder-canvas'] textarea[placeholder='Label'], .form-canvas input[placeholder='Label'], .form-canvas textarea[placeholder='Label']\");"
+            "  const canvasRows = page.locator(\"[data-testid='form-builder-canvas'] .form-row[draggable='true'], .form-canvas .form-row[draggable='true'], .form-drop-area .form-row[draggable='true']\");"
             "  const extractLabel = (selector) => {"
             "    if (!selector) return null;"
             "    const lower = selector.toLowerCase();"
             "    if (lower.includes('short-answer') || lower.includes('short answer') || lower.includes('field-short')) return 'Short answer';"
             "    if (lower.includes('field-email')) return 'Email';"
+            "    if (lower.includes('aria-label') && lower.includes('email')) return 'Email';"
+            "    if (lower.includes('aria-label') && lower.includes('short')) return 'Short answer';"
             "    const m1 = selector.match(/:has-text\\((['\\\"])(.*?)\\1\\)/i);"
             "    if (m1 && m1[2] && m1[2].trim()) return m1[2].trim();"
             "    const m2 = selector.match(/^text\\s*=\\s*(.+)$/i);"
@@ -1059,36 +1212,131 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "  const sourceLabel = extractLabel(sourceSelectorText);"
             "  let hadPlaceholder = false;"
             "  let beforeInsertedCount = 0;"
+            "  let beforeRowCount = 0;"
             "  let beforeCanvasText = '';"
             "  try { hadPlaceholder = await placeholder.isVisible(); } catch (e) {}"
             "  try { beforeInsertedCount = await insertedFields.count(); } catch (e) {}"
+            "  try {"
+            "    const rows = await canvasRows.count();"
+            "    let usable = 0;"
+            "    for (let i = 0; i < rows; i += 1) {"
+            "      const row = canvasRows.nth(i);"
+            "      const rowText = (((await row.textContent()) || '').trim().toLowerCase());"
+            "      if (rowText.includes('drag and drop fields here')) continue;"
+            "      usable += 1;"
+            "    }"
+            "    beforeRowCount = usable;"
+            "  } catch (e) {}"
             "  try { beforeCanvasText = ((await canvasRoot.textContent()) || '').trim(); } catch (e) {}"
             "  let sourceLocator = source;"
             "  let targetLocator = target;"
             "  try {"
-            "    if ((await sourceLocator.count()) === 0 && sourceLabel) {"
-            "      const sourceCandidates = ["
+            "    const targetCandidates = ["
+            "      page.locator(\"[data-testid='form-builder-canvas']\").first(),"
+            "      page.locator('.form-canvas').first(),"
+            "      page.locator('.form-builder-canvas').first(),"
+            "      page.locator('.form-drop-area').first(),"
+            "      page.locator(\"[data-testid='form-builder-canvas'] .form-row[draggable='true']\").last(),"
+            "      page.locator('.form-canvas .form-row[draggable='true']').last(),"
+            "      page.locator('.form-drop-area .form-row[draggable='true']').last(),"
+            "      page.locator(\"div.form-row[draggable='true']:has-text('Drag and drop fields here')\").first(),"
+            "      page.locator(\"div.form-row.relative.flex.w-full[draggable='true']:has-text('Drag and drop fields here')\").first(),"
+            "      canvasRoot,"
+            "      target,"
+            "      placeholder,"
+            "    ];"
+            "    let fallbackTarget = null;"
+            "    for (const candidate of targetCandidates) {"
+            "      try {"
+            "        if ((await candidate.count()) === 0) continue;"
+            "        await candidate.waitFor({ state: 'visible', timeout: 1100 });"
+            "        const box = await candidate.boundingBox();"
+            "        if (!box) continue;"
+            "        if (!fallbackTarget) fallbackTarget = candidate;"
+            "        if (box.x > 250 && box.width > 220) {"
+            "          targetLocator = candidate;"
+            "          break;"
+            "        }"
+            "      } catch (e) {}"
+            "    }"
+            "    if ((await targetLocator.count()) === 0 && fallbackTarget) targetLocator = fallbackTarget;"
+            "  } catch (e) {}"
+            "  if (isVitaOne) {"
+            "    try {"
+            "      const strongCanvas = page.locator(\"[data-testid='form-builder-canvas'], .form-canvas, .form-drop-area, .form-builder-canvas\").first();"
+            "      if ((await strongCanvas.count()) > 0) {"
+            "        await strongCanvas.waitFor({ state: 'visible', timeout: 1200 });"
+            "        targetLocator = strongCanvas;"
+            "      }"
+            "    } catch (e) {}"
+            "  }"
+            "  const quickTimeoutMs = 1600;"
+            f"  if ((await targetLocator.count()) === 0) throw new Error({json.dumps('Drag target not found: ' + target_selector)});"
+            "  await targetLocator.waitFor({ state: 'visible', timeout: quickTimeoutMs });"
+            "  const targetBoxPre = await targetLocator.boundingBox();"
+            "  try {"
+            "    const sourceCandidates = [];"
+            "    if (sourceLabel) {"
+            "      const key = sourceLabel.toLowerCase().split(/\\s+/)[0] || sourceLabel.toLowerCase();"
+            "      sourceCandidates.push("
+            "        page.locator(`[draggable='true']:has-text(\"${sourceLabel}\")`).first(),"
+            "        page.locator(`[draggable='true'][aria-label*='${sourceLabel}']`).first(),"
+            "        page.locator(`[role='listitem']:has-text(\"${sourceLabel}\")`).first(),"
+            "        page.locator(`[data-rbd-draggable-id*='${key}']`).first(),"
+            "        page.locator(`[data-testid*='${key}']`).first(),"
             "        page.locator(`button:has-text(\"${sourceLabel}\")`).first(),"
             "        page.locator(`[role='button']:has-text(\"${sourceLabel}\")`).first(),"
-            "        page.locator(`[data-testid*='field-']:has-text(\"${sourceLabel}\")`).first(),"
             "        page.getByText(sourceLabel, { exact: false }).first(),"
-            "      ];"
-            "      for (const candidate of sourceCandidates) {"
-            "        try { if ((await candidate.count()) > 0) { sourceLocator = candidate; break; } } catch (e) {}"
-            "      }"
+            "      );"
             "    }"
-            "  } catch (e) {}"
-            "  try {"
-            "    if ((await targetLocator.count()) === 0) {"
-            "      if ((await canvasRoot.count()) > 0) targetLocator = canvasRoot;"
-            "      else if (hadPlaceholder) targetLocator = placeholder;"
+            "    sourceCandidates.push(source);"
+            "    let fallbackSource = null;"
+            "    for (const candidate of sourceCandidates) {"
+            "      try {"
+            "        if ((await candidate.count()) === 0) continue;"
+            "        await candidate.waitFor({ state: 'visible', timeout: 1100 });"
+            "        const box = await candidate.boundingBox();"
+            "        if (!box) continue;"
+            "        if (!fallbackSource) fallbackSource = candidate;"
+            "        if (targetBoxPre && box.x < targetBoxPre.x) {"
+            "          sourceLocator = candidate;"
+            "          break;"
+            "        }"
+            "      } catch (e) {}"
             "    }"
+            "    if ((await sourceLocator.count()) === 0 && fallbackSource) sourceLocator = fallbackSource;"
             "  } catch (e) {}"
-            "  const quickTimeoutMs = 1600;"
             "  if ((await sourceLocator.count()) === 0) throw new Error(`Drag source not found: ${sourceSelectorText}`);"
-            f"  if ((await targetLocator.count()) === 0) throw new Error({json.dumps('Drag target not found: ' + target_selector)});"
             "  await sourceLocator.waitFor({ state: 'visible', timeout: quickTimeoutMs });"
-            "  await targetLocator.waitFor({ state: 'visible', timeout: quickTimeoutMs });"
+            "  if (isVitaOne) {"
+            "    try {"
+            "      await sourceLocator.click({ timeout: 900 });"
+            "      await page.waitForTimeout(140);"
+            "      let quickCount = beforeInsertedCount;"
+            "      let quickRows = beforeRowCount;"
+            "      try { quickCount = await insertedFields.count(); } catch (e) {}"
+            "      try {"
+            "        const rows = await canvasRows.count();"
+            "        let usable = 0;"
+            "        for (let i = 0; i < rows; i += 1) {"
+            "          const row = canvasRows.nth(i);"
+            "          const rowText = (((await row.textContent()) || '').trim().toLowerCase());"
+            "          if (rowText.includes('drag and drop fields here')) continue;"
+            "          usable += 1;"
+            "        }"
+            "        quickRows = usable;"
+            "      } catch (e) {}"
+            "      let quickDialogVisible = false;"
+            "      try {"
+            "        quickDialogVisible = await page.locator(\"div[role='dialog'] input[placeholder='Enter a label'], div[role='dialog'] button:has-text('Save')\").first().isVisible();"
+            "      } catch (e) {}"
+            "      if (quickRows > beforeRowCount || quickCount > beforeInsertedCount || quickDialogVisible) {"
+            f"        return {json.dumps(message + ' (vitaone click-insert fast path)')};"
+            "      }"
+            "    } catch (eFastInsert) {"
+            "      // continue with drag strategies"
+            "    }"
+            "  }"
             "  const validate = async () => {"
             f"    await page.waitForTimeout({validation_wait});"
             "    let placeholderVisible = false;"
@@ -1096,29 +1344,102 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "      try { placeholderVisible = await placeholder.isVisible(); } catch (e) {}"
             "    }"
             "    let currentCount = beforeInsertedCount;"
+            "    let currentRows = beforeRowCount;"
             "    try { currentCount = await insertedFields.count(); } catch (e) {}"
+            "    try {"
+            "      const rows = await canvasRows.count();"
+            "      let usable = 0;"
+            "      for (let i = 0; i < rows; i += 1) {"
+            "        const row = canvasRows.nth(i);"
+            "        const rowText = (((await row.textContent()) || '').trim().toLowerCase());"
+            "        if (rowText.includes('drag and drop fields here')) continue;"
+            "        usable += 1;"
+            "      }"
+            "      currentRows = usable;"
+            "    } catch (e) {}"
             "    let currentCanvasText = beforeCanvasText;"
             "    try { currentCanvasText = ((await canvasRoot.textContent()) || '').trim(); } catch (e) {}"
             "    if (hadPlaceholder && !placeholderVisible) return true;"
+            "    if (currentRows > beforeRowCount) return true;"
             "    if (currentCount > beforeInsertedCount) return true;"
             "    if (currentCanvasText && currentCanvasText !== beforeCanvasText) return true;"
             "    if (hadPlaceholder) throw new Error('Drop not applied: canvas placeholder still visible and no new field appeared');"
-            "    throw new Error('Drop not applied: no new field appeared in canvas');"
+            "    throw new Error(`Drop not applied: no new field appeared in canvas (rows ${beforeRowCount}->${currentRows}, fields ${beforeInsertedCount}->${currentCount})`);"
             "  };"
+            "  if (isVitaOne) {"
+            "    try {"
+            "      await sourceLocator.scrollIntoViewIfNeeded();"
+            "      await targetLocator.scrollIntoViewIfNeeded();"
+            "      const sbV = await sourceLocator.boundingBox();"
+            "      const tbV = await targetLocator.boundingBox();"
+            "      if (sbV && tbV) {"
+            "        let tx = tbV.x + Math.min(Math.max(220, 120), Math.max(Math.floor(tbV.width) - 120, 120));"
+            "        let ty = tbV.y + Math.min(Math.max(200, 120), Math.max(Math.floor(tbV.height) - 120, 120));"
+            "        if (" + ("true" if fixed_coords else "false") + ") {"
+            f"          const reqX = {x_offset};"
+            f"          const reqY = {y_offset};"
+            "          const safeX = Math.min(Math.max(reqX, 120), Math.max(Math.floor(tbV.width) - 120, 120));"
+            "          const safeY = Math.min(Math.max(reqY, 120), Math.max(Math.floor(tbV.height) - 120, 120));"
+            "          tx = tbV.x + safeX;"
+            "          ty = tbV.y + safeY;"
+            "        }"
+            "        try {"
+            "          const rowLocator = page.locator(\"[data-testid='form-builder-canvas'] .form-row[draggable='true'], .form-canvas .form-row[draggable='true']\");"
+            "          const rowCount = await rowLocator.count();"
+            "          if (rowCount > 0) {"
+            "            let maxBottom = tbV.y + 80;"
+            "            let leftX = tbV.x + 140;"
+            "            const sample = Math.min(rowCount, 15);"
+            "            for (let i = 0; i < sample; i += 1) {"
+            "              const row = rowLocator.nth(i);"
+            "              const rowText = (((await row.textContent()) || '').trim().toLowerCase());"
+            "              if (rowText.includes('drag and drop fields here')) continue;"
+            "              const rb = await row.boundingBox();"
+            "              if (!rb) continue;"
+            "              const bottom = rb.y + rb.height;"
+            "              if (bottom > maxBottom) {"
+            "                maxBottom = bottom;"
+            "                leftX = rb.x + 40;"
+            "              }"
+            "            }"
+            "            tx = Math.min(Math.max(leftX, tbV.x + 90), tbV.x + Math.max(Math.floor(tbV.width) - 130, 130));"
+            "            const topSafe = tbV.y + 100;"
+            "            const bottomSafe = tbV.y + Math.max(Math.floor(tbV.height) - 80, 180);"
+            "            ty = Math.min(Math.max(maxBottom + 56, topSafe), bottomSafe);"
+            "          }"
+            "        } catch (eRows) {}"
+            "        const sx = sbV.x + Math.max(Math.min(sbV.width * 0.30, sbV.width - 10), 10);"
+            "        const sy = sbV.y + Math.max(Math.min(sbV.height * 0.50, sbV.height - 6), 6);"
+            "        await page.mouse.move(sx, sy);"
+            "        await page.mouse.down();"
+            "        await page.waitForTimeout(120);"
+            "        await page.mouse.move(sx + 18, sy + 4, { steps: 8 });"
+            "        await page.waitForTimeout(40);"
+            f"        await page.mouse.move(tx, ty, {{ steps: {max(mouse_steps, 36)} }});"
+            "        await page.waitForTimeout(120);"
+            "        await page.mouse.up();"
+            "        await validate();"
+            f"        return {json.dumps(message + ' (vitaone pointer drag)')};"
+            "      }"
+            "    } catch (eVitaPointer) {"
+            "      // continue with generic strategies"
+            "    }"
+            "  }"
             "  try {"
             "    const sb0 = await sourceLocator.boundingBox();"
             "    const tb0 = await targetLocator.boundingBox();"
-            "    const dragTimeoutMs = 1800;"
+            "    const dragTimeoutMs = isVitaOne ? 700 : 1400;"
+            "    if (isVitaOne) {"
+            "      throw new Error('skip native dragTo for vitaone');"
+            "    }"
             "    if (sb0 && tb0) {"
             "      const srcPoints = ["
             "        { x: Math.max(Math.min(sb0.width * 0.18, sb0.width - 6), 6), y: sb0.height * 0.50 },"
             "        { x: sb0.width * 0.50, y: sb0.height * 0.50 },"
-            "        { x: Math.max(Math.min(sb0.width * 0.80, sb0.width - 6), 6), y: sb0.height * 0.50 },"
             "      ];"
             "      const tgtPoints = ["
             "        { x: Math.max(Math.min(tb0.width * 0.30, tb0.width - 16), 16), y: Math.max(Math.min(tb0.height * 0.30, tb0.height - 16), 16) },"
             "        { x: Math.max(Math.min(tb0.width * 0.50, tb0.width - 16), 16), y: Math.max(Math.min(tb0.height * 0.50, tb0.height - 16), 16) },"
-            "        { x: Math.max(Math.min(tb0.width * 0.70, tb0.width - 16), 16), y: Math.max(Math.min(tb0.height * 0.70, tb0.height - 16), 16) },"
             "      ];"
             "      for (const sp of srcPoints) {"
             "        for (const tp of tgtPoints) {"
@@ -1152,8 +1473,39 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "        if (useFixed) {"
             "          const safeX = Math.min(Math.max(requestedX, 16), Math.max(Math.floor(tb.width) - 16, 16));"
             "          const safeY = Math.min(Math.max(requestedY, 16), Math.max(Math.floor(tb.height) - 16, 16));"
-            "          const baseX = tb.x + safeX;"
-            "          const baseY = tb.y + safeY;"
+            "          let baseX = tb.x + safeX;"
+            "          let baseY = tb.y + safeY;"
+            "          if (isVitaOne) {"
+            "            try {"
+            "              const rowLocator = page.locator(\"[data-testid='form-builder-canvas'] .form-row[draggable='true'], .form-canvas .form-row[draggable='true']\");"
+            "              const rowCount = await rowLocator.count();"
+            "              if (rowCount > 0) {"
+            "                let maxBottom = tb.y + 80;"
+            "                let leftX = tb.x + 120;"
+            "                const sample = Math.min(rowCount, 15);"
+            "                for (let i = 0; i < sample; i += 1) {"
+            "                  const row = rowLocator.nth(i);"
+            "                  const rowText = (((await row.textContent()) || '').trim().toLowerCase());"
+            "                  if (rowText.includes('drag and drop fields here')) continue;"
+            "                  const rb = await row.boundingBox();"
+            "                  if (!rb) continue;"
+            "                  const bottom = rb.y + rb.height;"
+            "                  if (bottom > maxBottom) {"
+            "                    maxBottom = bottom;"
+            "                    leftX = rb.x + 40;"
+            "                  }"
+            "                }"
+            "                const minX = tb.x + 90;"
+            "                const maxX = tb.x + Math.max(Math.floor(tb.width) - 130, 130);"
+            "                baseX = Math.min(Math.max(leftX, minX), maxX);"
+            "                const topSafe = tb.y + 100;"
+            "                const bottomSafe = tb.y + Math.max(Math.floor(tb.height) - 80, 180);"
+            "                baseY = Math.min(Math.max(maxBottom + 56, topSafe), bottomSafe);"
+            "              }"
+            "            } catch (eStack) {"
+            "              // keep default drop offsets"
+            "            }"
+            "          }"
             "          const nearLeftX = tb.x + Math.min(Math.max(64, 16), Math.max(Math.floor(tb.width) - 16, 16));"
             "          const nearTopY = tb.y + Math.min(Math.max(96, 16), Math.max(Math.floor(tb.height) - 16, 16));"
             "          points = ["

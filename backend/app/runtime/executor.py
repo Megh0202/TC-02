@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from pathlib import Path
 import asyncio
 import logging
 import re
@@ -85,27 +85,41 @@ DEFAULT_SELECTOR_PROFILE: dict[str, list[str]] = {
         "text=Short answer",
     ],
     "email_field_source": [
-        "[data-testid='field-email']",
-        "[data-testid*='field-email']",
-        "[data-rbd-draggable-id*='email']",
         "[draggable='true'][aria-label*='Email']",
         "[draggable='true']:has-text('Email')",
         "[role='listitem']:has-text('Email')",
+        "[data-rbd-draggable-id*='email']",
+        "[data-testid='field-email']",
+        "[data-testid*='field-email']",
+        "button:has-text('Email')",
+        "[role='button']:has-text('Email')",
         "text=Email",
     ],
+    "dropdown_field_source": [
+        "[data-testid='field-dropdown']",
+        "[data-testid*='field-dropdown']",
+        "[data-rbd-draggable-id*='dropdown']",
+        "[draggable='true']:has-text('Dropdown')",
+        "[role='listitem']:has-text('Dropdown')",
+        "button:has-text('Dropdown')",
+        "[role='button']:has-text('Dropdown')",
+        "text=Dropdown",
+    ],
     "form_canvas_target": [
-        "div.form-row[draggable='true']:has-text('Drag and drop fields here')",
-        "div.form-row.relative.flex.w-full[draggable='true']:has-text('Drag and drop fields here')",
+        "[data-row-id].form-row[draggable='true']",
+        "[data-row-id]",
         "[data-testid='form-builder-canvas']",
+        ".form-canvas",
+        ".form-drop-area",
         "[data-testid*='form-builder'][class*='canvas']",
         ".form-builder-canvas",
-        ".form-drop-area",
         ".form-builder-drop-area",
         ".form-builder-editor",
-        ".form-canvas",
         "[data-testid='form-canvas']",
         "[class*='drop'][class*='canvas']",
         "[class*='builder'][class*='canvas']",
+        "div.form-row[draggable='true']:has-text('Drag and drop fields here')",
+        "div.form-row.relative.flex.w-full[draggable='true']:has-text('Drag and drop fields here')",
         "div:has-text('Drag and drop fields here')",
         "section:has-text('Drag and drop fields here')",
         "[role='application']",
@@ -621,11 +635,13 @@ class AgentExecutor:
         if step_type == "drag":
             if any(
                 token in selector_lower
-                for token in ("short answer", "short_answer", "shortanswer", "draggable")
+                for token in ("short answer", "short_answer", "shortanswer")
             ):
                 keys.insert(0, "short_answer_source")
             if any(token in selector_lower for token in ("email", "field-email")):
                 keys.insert(0, "email_field_source")
+            if any(token in selector_lower for token in ("dropdown", "linked dropdown", "field-dropdown")):
+                keys.insert(0, "dropdown_field_source")
             if any(
                 token in selector_lower
                 for token in ("canvas", "dropzone", "drop zone", "form-canvas", "form builder")
@@ -687,43 +703,98 @@ class AgentExecutor:
                 if "text=short answer" in s:
                     value -= 25
             if key == "form_canvas_target":
+                if "[data-row-id].form-row[draggable='true']" in s:
+                    value -= 95
+                if "[data-row-id]" in s:
+                    value -= 90
                 if "[data-testid='form-builder-canvas']" in s:
                     value -= 85
                 if ".form-canvas" in s or ".form-drop-area" in s or ".form-builder-canvas" in s:
                     value -= 70
                 if "[data-testid='form-canvas']" in s or "[class*='drop'][class*='canvas']" in s:
                     value -= 55
-                if "drag and drop fields here" in s:
+                if "div.form-row[draggable='true']:has-text('drag and drop fields here')" in s:
                     value -= 25
+                if "div.form-row.relative.flex.w-full[draggable='true']:has-text('drag and drop fields here')" in s:
+                    value -= 22
+                if "drag and drop fields here" in s:
+                    value += 15
                 if "[role='application']" in s:
                     value += 25
+            if key == "email_field_source":
+                if "[draggable='true']" in s:
+                    value -= 90
+                if "[role='listitem']" in s:
+                    value -= 75
+                if "[data-rbd-draggable-id*='email']" in s:
+                    value -= 70
+                if "[data-testid='field-email']" in s:
+                    value -= 55
+                if "[data-testid*='field-email']" in s:
+                    value -= 50
+                if "button:has-text('email')" in s or "[role='button']:has-text('email')" in s:
+                    value -= 40
+                if "text=email" in s:
+                    value -= 20
             return value
 
         return sorted(candidates, key=score)
 
     def _filter_alias_candidates(self, alias_key: str, candidates: list[str]) -> list[str]:
         key = alias_key.strip().lower()
-        if key != "form_label":
-            return candidates
+        if key == "form_label":
+            blocked_tokens = (
+                "#formname",
+                "input#formname",
+                "input[name='formname']",
+                "input[name='name']",
+                "textarea[name='name']",
+                "placeholder*='name'",
+                "placeholder=\"name\"",
+                "placeholder='name'",
+                "input[type='text']",
+            )
+            filtered = [
+                candidate
+                for candidate in candidates
+                if not any(token in candidate.lower() for token in blocked_tokens)
+            ]
+            return filtered or candidates
 
-        blocked_tokens = (
-            "#formname",
-            "input#formname",
-            "input[name='formname']",
-            "input[name='name']",
-            "textarea[name='name']",
-            "placeholder*='name'",
-            "placeholder=\"name\"",
-            "placeholder='name'",
-            "input[type='text']",
-        )
+        if key == "email":
+            # Prevent cross-field leakage from selector memory.
+            blocked_tokens = (
+                "#password",
+                "name='password'",
+                "name=\"password\"",
+                "type='password'",
+                "type=\"password\"",
+            )
+            filtered = [
+                candidate
+                for candidate in candidates
+                if not any(token in candidate.lower() for token in blocked_tokens)
+            ]
+            return filtered or candidates
 
-        filtered = [
-            candidate
-            for candidate in candidates
-            if not any(token in candidate.lower() for token in blocked_tokens)
-        ]
-        return filtered or candidates
+        if key == "password":
+            blocked_tokens = (
+                "#username",
+                "name='username'",
+                "name=\"username\"",
+                "type='email'",
+                "type=\"email\"",
+                "autocomplete='email'",
+                "autocomplete=\"email\"",
+            )
+            filtered = [
+                candidate
+                for candidate in candidates
+                if not any(token in candidate.lower() for token in blocked_tokens)
+            ]
+            return filtered or candidates
+
+        return candidates
 
     async def _run_with_drag_fallback(
         self,
@@ -736,6 +807,12 @@ class AgentExecutor:
         target_offset_x: int | None = None,
         target_offset_y: int | None = None,
     ) -> str:
+        is_vitaone_domain = bool(run_domain and "vitaone.io" in run_domain.lower())
+        target_seed = raw_target_selector
+        if is_vitaone_domain and "drag and drop fields here" in raw_target_selector.lower():
+            # Avoid stale placeholder target after first drop.
+            target_seed = "form_canvas_target"
+
         source_candidates = self._selector_candidates(
             raw_source_selector,
             "drag",
@@ -744,7 +821,7 @@ class AgentExecutor:
             run_domain,
         )
         target_candidates = self._selector_candidates(
-            raw_target_selector,
+            target_seed,
             "drag",
             selector_profile,
             test_data,
@@ -772,6 +849,27 @@ class AgentExecutor:
             source_pool.append(source_text_candidate)
         if target_placeholder_candidate and target_placeholder_candidate not in target_pool:
             target_pool.append(target_placeholder_candidate)
+
+        if is_vitaone_domain:
+            # Second+ drags should always target stable canvas selectors, not placeholder text.
+            target_pool = [
+                candidate
+                for candidate in target_pool
+                if "drag and drop fields here" not in candidate.lower()
+            ] or target_pool
+
+            # For email field, prefer direct text/has-text selectors over aria-label variants.
+            if "email" in raw_source_selector.lower():
+                email_prioritized: list[str] = []
+                for candidate in source_pool:
+                    lower_candidate = candidate.lower()
+                    if ":has-text('email')" in lower_candidate or "text=email" in lower_candidate:
+                        email_prioritized.append(candidate)
+                for candidate in source_pool:
+                    if candidate not in email_prioritized:
+                        email_prioritized.append(candidate)
+                source_pool = email_prioritized
+
         primary_targets = target_pool[:2] if len(target_pool) >= 2 else target_pool
         pair_set: set[tuple[str, str]] = set()
         pairs: list[tuple[str, str]] = []
@@ -807,12 +905,13 @@ class AgentExecutor:
             raise ValueError("No drag selector pairs available")
 
         # VitaOne builder drag is sensitive; repeated multi-pair retries can cause
-        # duplicate drag actions even after a successful visual drop.
-        if run_domain and "vitaone.io" in run_domain.lower():
-            pairs = pairs[:1]
+        # duplicate drag actions even after a successful visual drop. Keep
+        # attempts bounded but allow more than one source candidate.
+        if is_vitaone_domain:
+            pairs = pairs[:3]
 
         recovery_attempts = max(1, min(self._selector_recovery_attempts(), 2))
-        if run_domain and "vitaone.io" in run_domain.lower():
+        if is_vitaone_domain:
             recovery_attempts = 1
         step_timeout = max(float(getattr(self._settings, "step_timeout_seconds", 60)), 5.0)
         # Drag/drop UIs often need a longer interaction window than click/type.
@@ -872,6 +971,75 @@ class AgentExecutor:
                         return result
                     except Exception as exc:
                         last_error = exc
+                        compact_error = self._compact_error(exc).lower()
+                        timeout_like = isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or (
+                            "timeout" in compact_error
+                        )
+                        if is_vitaone_domain and timeout_like:
+                            drag_label = self._extract_drag_label_from_selector(
+                                raw_source_selector
+                            ) or self._extract_drag_label_from_selector(source_selector)
+                            if drag_label:
+                                try:
+                                    await asyncio.wait_for(
+                                        self._browser.verify_text(
+                                            selector="[data-row-id], [data-testid='form-builder-canvas'], .form-canvas, .form-drop-area, div[role='dialog']",
+                                            match="contains",
+                                            value=drag_label,
+                                        ),
+                                        timeout=min(pair_timeout_s, 4.0),
+                                    )
+                                    self._remember_selector_success(
+                                        run_domain=run_domain,
+                                        step_type="drag",
+                                        raw_selector=raw_source_selector,
+                                        resolved_selector=source_selector,
+                                        text_hint=None,
+                                    )
+                                    self._remember_selector_success(
+                                        run_domain=run_domain,
+                                        step_type="drag",
+                                        raw_selector=raw_target_selector,
+                                        resolved_selector=target_selector,
+                                        text_hint=None,
+                                    )
+                                    return (
+                                        f"Dragged {source_selector} to {target_selector} "
+                                        "(executor post-timeout success check)"
+                                    )
+                                except Exception:
+                                    pass
+                            # VitaOne often opens an edit dialog immediately after a successful drop.
+                            # If label editor is visible, treat timeout as recovered success.
+                            try:
+                                await asyncio.wait_for(
+                                    self._browser.verify_text(
+                                        selector="div[role='dialog'], [role='dialog'] input[placeholder='Enter a label'], [role='dialog'] button:has-text('Save')",
+                                        match="contains",
+                                        value="Save",
+                                    ),
+                                    timeout=min(pair_timeout_s, 3.0),
+                                )
+                                self._remember_selector_success(
+                                    run_domain=run_domain,
+                                    step_type="drag",
+                                    raw_selector=raw_source_selector,
+                                    resolved_selector=source_selector,
+                                    text_hint=None,
+                                )
+                                self._remember_selector_success(
+                                    run_domain=run_domain,
+                                    step_type="drag",
+                                    raw_selector=raw_target_selector,
+                                    resolved_selector=target_selector,
+                                    text_hint=None,
+                                )
+                                return (
+                                    f"Dragged {source_selector} to {target_selector} "
+                                    "(executor dialog-visible success check)"
+                                )
+                            except Exception:
+                                pass
                         attempts.append(
                             "pass "
                             f"{cycle + 1}: {source_selector} -> {target_selector} "
@@ -1124,6 +1292,27 @@ class AgentExecutor:
         return ordered
 
     @staticmethod
+    def _extract_drag_label_from_selector(selector: str) -> str | None:
+        text = selector.strip()
+        lowered = text.lower()
+        if any(token in lowered for token in ("short answer", "short-answer", "short_answer", "field-short")):
+            return "Short answer"
+        if any(token in lowered for token in ("field-email", "email")):
+            return "Email"
+        if any(token in lowered for token in ("field-dropdown", "linked dropdown", "dropdown")):
+            return "Dropdown"
+
+        has_text = re.search(r":has-text\((['\"])(.*?)\1\)", text, re.IGNORECASE)
+        if has_text and has_text.group(2).strip():
+            return has_text.group(2).strip()
+
+        text_selector = re.search(r"^text\s*=\s*(.+)$", text, re.IGNORECASE)
+        if text_selector and text_selector.group(1).strip():
+            return text_selector.group(1).strip().strip("'\"")
+
+        return None
+
+    @staticmethod
     def _compact_error(exc: Exception) -> str:
         text = str(exc).strip().replace("\r", " ").replace("\n", " ")
         text = re.sub(r"\s+", " ", text)
@@ -1165,7 +1354,8 @@ class AgentExecutor:
 
         selector_lower = raw_selector.lower()
         if step_type == "type":
-            if "email" in selector_lower or (text_hint and "@" in text_hint):
+            # Do not infer email key from "@" because passwords often contain it.
+            if "email" in selector_lower:
                 keys.extend(["email", "username"])
             if "password" in selector_lower or (text_hint and "password" in text_hint.lower()):
                 keys.append("password")
@@ -1198,11 +1388,13 @@ class AgentExecutor:
         if step_type == "drag":
             if any(
                 token in selector_lower
-                for token in ("short answer", "short_answer", "shortanswer", "draggable")
+                for token in ("short answer", "short_answer", "shortanswer")
             ):
                 keys.append("short_answer_source")
             if any(token in selector_lower for token in ("email", "field-email")):
                 keys.append("email_field_source")
+            if any(token in selector_lower for token in ("dropdown", "linked dropdown", "field-dropdown")):
+                keys.append("dropdown_field_source")
             if any(
                 token in selector_lower
                 for token in ("canvas", "dropzone", "drop zone", "form-canvas", "form builder")

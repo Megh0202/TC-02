@@ -45,3 +45,61 @@ def test_structured_prompt_inserts_create_click_after_form_name_before_drag() ->
     assert steps[form_name_index + 1]["selector"] == "{{selector.create_form_confirm}}"
     assert steps[form_name_index + 2]["type"] == "wait"
     assert steps[form_name_index + 3]["type"] == "drag"
+
+
+def test_drag_step_uses_email_source_alias_when_email_field_is_requested() -> None:
+    task = """
+1) Navigate to https://test.vitaone.io
+2) Select 'Email' field and Drag and Drop in the form
+"""
+    steps = parse_structured_task_steps(task, max_steps=20)
+    drag_step = next(step for step in steps if step["type"] == "drag")
+    assert drag_step["source_selector"] == "{{selector.email_field_source}}"
+    assert drag_step["target_selector"] == "{{selector.form_canvas_target}}"
+
+
+def test_drag_step_supports_generic_field_label() -> None:
+    task = """
+1) Navigate to https://test.vitaone.io
+2) Select 'Number' field and Drag and Drop in the form
+"""
+    steps = parse_structured_task_steps(task, max_steps=20)
+    drag_step = next(step for step in steps if step["type"] == "drag")
+    assert drag_step["source_selector"] == "[draggable='true']:has-text(\"Number\")"
+
+
+def test_explicit_selector_lines_are_all_parsed_without_dropping_steps() -> None:
+    task = """
+1) Navigate to https://test.vitaone.io
+2) Type "balasubramanian.r@teknotrait.com" into #username
+3) Type "PasswordVitaone1@" into #password
+4) Click button[name='login']
+5) Wait 1500ms
+6) Click button:has-text('Create Form')
+7) Type "QA_Form_{{NOW_YYYYMMDD_HHMMSS}}" into input[name='name']
+8) Click [role='dialog'] button:has-text('Create')
+9) Wait 1200ms
+10) Click [draggable='true']:has-text('Short answer')
+11) Drag [draggable='true']:has-text('Short answer') to [data-testid='form-builder-canvas']
+12) Wait 700ms
+13) Type "First Name" into div[role='dialog'] input[placeholder='Enter a label']
+14) Click div[role='dialog'] label:has-text('Required')
+15) Click div[role='dialog'] button:has-text('Save')
+16) Wait 800ms
+"""
+    steps = parse_structured_task_steps(task, max_steps=30)
+
+    assert len(steps) == 16
+    assert steps[1] == {
+        "type": "type",
+        "selector": "#username",
+        "text": "balasubramanian.r@teknotrait.com",
+        "clear_first": True,
+    }
+    assert steps[3] == {"type": "click", "selector": "button[name='login']"}
+    assert steps[4] == {"type": "wait", "until": "timeout", "ms": 1500}
+    assert steps[10] == {
+        "type": "drag",
+        "source_selector": "[draggable='true']:has-text('Short answer')",
+        "target_selector": "[data-testid='form-builder-canvas']",
+    }

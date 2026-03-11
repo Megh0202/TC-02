@@ -70,7 +70,7 @@ type JsonObject = Record<string, unknown>;
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8080";
 const ADMIN_API_TOKEN = process.env.NEXT_PUBLIC_ADMIN_API_TOKEN?.trim() ?? "";
-const DEFAULT_MAX_STEPS = 20;
+const DEFAULT_MAX_STEPS = 300;
 const SHOW_ADVANCED_INPUTS =
   process.env.NEXT_PUBLIC_SHOW_ADVANCED_INPUTS?.trim().toLowerCase() === "true";
 

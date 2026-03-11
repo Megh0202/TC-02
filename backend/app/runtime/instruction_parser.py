@@ -7,6 +7,14 @@ from typing import Any
 _LINE_PREFIX_RE = re.compile(r"^\s*(?:\d+[\).:-]\s*|[-*]\s+)")
 _URL_RE = re.compile(r"https?://[^\s\"'>]+", flags=re.IGNORECASE)
 _QUOTED_RE = re.compile(r"['\"]([^'\"]+)['\"]")
+_TYPE_INTO_RE = re.compile(r"^\s*(?:type|enter)\s+(.+?)\s+into\s+(.+?)\s*$", flags=re.IGNORECASE)
+_DRAG_TO_RE = re.compile(r"^\s*drag\s+(.+?)\s+to\s+(.+?)\s*$", flags=re.IGNORECASE)
+_CLICK_RE = re.compile(r"^\s*click(?:\s+on)?\s+(.+?)\s*$", flags=re.IGNORECASE)
+_WAIT_MS_RE = re.compile(r"\bwait\s+(\d{2,6})\s*ms\b", flags=re.IGNORECASE)
+_VERIFY_CONTAINS_ON_RE = re.compile(
+    r"^\s*verify(?:\s+text)?\s+contains\s+(.+?)\s+on\s+(.+?)\s*$",
+    flags=re.IGNORECASE,
+)
 
 
 def parse_structured_task_steps(task: str, max_steps: int) -> list[dict[str, Any]]:
@@ -15,13 +23,45 @@ def parse_structured_task_steps(task: str, max_steps: int) -> list[dict[str, Any
     Returns an empty list when the task does not look like structured instructions.
     """
     lines = [_normalize_line(raw) for raw in task.splitlines()]
-    instruction_lines = [line for line in lines if line]
+    instruction_lines: list[str] = []
+    for line in lines:
+        if not line:
+            continue
+        instruction_lines.extend(_split_compound_actions(line))
     if len(instruction_lines) < 2:
         return []
 
     steps: list[dict[str, Any]] = []
+    last_drag_source_selector: str | None = None
     for line in instruction_lines:
+        lower = line.lower()
+        normalized_lower = re.sub(r"[^a-z0-9\s]", " ", lower)
+        normalized_lower = re.sub(r"\s+", " ", normalized_lower).strip()
+        drag_field = _extract_drag_field_label(line)
+        if drag_field:
+            last_drag_source_selector = _drag_source_selector_from_label(drag_field)
+        elif any(token in lower for token in ("short answer", "short-answer", "short_answer")):
+            last_drag_source_selector = "{{selector.short_answer_source}}"
+        elif "email" in normalized_lower and "password" not in normalized_lower and "field" in normalized_lower:
+            last_drag_source_selector = "{{selector.email_field_source}}"
+
         parsed = _parse_line(line)
+        if (
+            parsed is not None
+            and parsed.get("type") == "drag"
+            and not drag_field
+            and last_drag_source_selector
+            and parsed.get("source_selector") == "{{selector.short_answer_source}}"
+        ):
+            parsed["source_selector"] = last_drag_source_selector
+
+        if parsed is None and _is_drag_drop_only_line(normalized_lower):
+            source_alias = last_drag_source_selector or "{{selector.short_answer_source}}"
+            parsed = {
+                "type": "drag",
+                "source_selector": source_alias,
+                "target_selector": "{{selector.form_canvas_target}}",
+            }
         if parsed is None:
             continue
         steps.append(parsed)
@@ -30,6 +70,34 @@ def parse_structured_task_steps(task: str, max_steps: int) -> list[dict[str, Any
     steps = _enforce_login_sequence(steps, max_steps=max_steps)
     steps = _enforce_form_create_sequence(steps, max_steps=max_steps)
     return steps[:max_steps]
+
+
+def _split_compound_actions(line: str) -> list[str]:
+    """
+    Split one instruction line into multiple action lines.
+    Keeps "drag and drop" together.
+    """
+    text = line.strip()
+    if not text:
+        return []
+
+    protected = text.replace("Drag and Drop", "Drag__AND__Drop").replace("drag and drop", "drag__AND__drop")
+    chunks = re.split(r"\s+\band\b\s+", protected, flags=re.IGNORECASE)
+    result: list[str] = []
+    for chunk in chunks:
+        normalized = chunk.replace("__AND__", " and ").strip(" ,.-")
+        if normalized:
+            result.append(normalized)
+    return result
+
+
+def _is_drag_drop_only_line(lower: str) -> bool:
+    return (
+        "drag" in lower
+        and "drop" in lower
+        and "form" in lower
+        and all(token not in lower for token in ("short answer", "short-answer", "short_answer", "email field"))
+    )
 
 
 def _normalize_line(raw: str) -> str:
@@ -80,10 +148,31 @@ def _parse_line(line: str) -> dict[str, Any] | None:
         value = _extract_form_name_value(line)
         return {"type": "type", "selector": "{{selector.form_name}}", "text": value, "clear_first": True}
 
-    if "drag" in lower and any(token in lower for token in ("short answer", "email field", "email")):
-        source_alias = "{{selector.short_answer_source}}"
-        if "email" in lower and "short answer" not in lower:
-            source_alias = "{{selector.email_field_source}}"
+    verify_contains = _parse_verify_contains_on_selector(line)
+    if verify_contains is not None:
+        return verify_contains
+
+    explicit_drag = _parse_explicit_drag(line)
+    if explicit_drag is not None:
+        return explicit_drag
+
+    explicit_type = _parse_explicit_type(line)
+    if explicit_type is not None:
+        return explicit_type
+
+    explicit_click = _parse_explicit_click(line)
+    if explicit_click is not None:
+        return explicit_click
+
+    if "drag" in lower and (
+        "drop" in lower
+        or "into the form" in lower
+        or "into form" in lower
+        or "form canvas" in lower
+        or "into the canvas" in lower
+    ):
+        field_label = _extract_drag_field_label(line)
+        source_alias = _drag_source_selector_from_label(field_label)
         return {
             "type": "drag",
             "source_selector": source_alias,
@@ -105,7 +194,8 @@ def _parse_line(line: str) -> dict[str, Any] | None:
         return {"type": "click", "selector": "{{selector.save_form}}"}
 
     if "wait" in lower:
-        return {"type": "wait", "until": "timeout", "ms": 1000}
+        wait_ms = _extract_wait_ms(line)
+        return {"type": "wait", "until": "timeout", "ms": wait_ms or 1000}
 
     return None
 
@@ -131,6 +221,100 @@ def _after_delimiter(text: str) -> str | None:
     return value or _first_quoted(text)
 
 
+def _parse_explicit_type(line: str) -> dict[str, Any] | None:
+    match = _TYPE_INTO_RE.match(line)
+    if not match:
+        return None
+    raw_value = match.group(1).strip()
+    raw_selector = match.group(2).strip()
+    text = _first_quoted(raw_value) or _strip_wrapping_quotes(raw_value)
+    selector = _normalize_selector_text(raw_selector)
+    if not text or not selector:
+        return None
+    return {"type": "type", "selector": selector, "text": text, "clear_first": True}
+
+
+def _parse_explicit_drag(line: str) -> dict[str, Any] | None:
+    match = _DRAG_TO_RE.match(line)
+    if not match:
+        return None
+    source_selector = _normalize_selector_text(match.group(1))
+    target_selector = _normalize_selector_text(match.group(2))
+    if not source_selector or not target_selector:
+        return None
+    return {
+        "type": "drag",
+        "source_selector": source_selector,
+        "target_selector": target_selector,
+    }
+
+
+def _parse_explicit_click(line: str) -> dict[str, Any] | None:
+    match = _CLICK_RE.match(line)
+    if not match:
+        return None
+    raw_target = _normalize_selector_text(match.group(1))
+    if not raw_target:
+        return None
+    normalized_target = _strip_wrapping_quotes(raw_target).strip()
+    lowered_target = normalized_target.lower()
+
+    if not _looks_like_explicit_selector(normalized_target):
+        if "create form" in lowered_target:
+            return {"type": "click", "selector": "{{selector.create_form}}"}
+        if "save" in lowered_target:
+            return {"type": "click", "selector": "{{selector.save_form}}"}
+        if "required" in lowered_target:
+            return {"type": "click", "selector": "{{selector.required_checkbox}}"}
+        return {"type": "click", "selector": f"text={normalized_target}"}
+
+    return {"type": "click", "selector": normalized_target}
+
+
+def _parse_verify_contains_on_selector(line: str) -> dict[str, Any] | None:
+    match = _VERIFY_CONTAINS_ON_RE.match(line)
+    if not match:
+        return None
+    raw_value = match.group(1).strip()
+    raw_selector = match.group(2).strip()
+    value = _first_quoted(raw_value) or _strip_wrapping_quotes(raw_value)
+    selector = _normalize_selector_text(raw_selector)
+    if not value or not selector:
+        return None
+    return {"type": "verify_text", "selector": selector, "match": "contains", "value": value}
+
+
+def _extract_wait_ms(text: str) -> int | None:
+    match = _WAIT_MS_RE.search(text)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _strip_wrapping_quotes(text: str) -> str:
+    candidate = text.strip()
+    if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in {"'", '"', "`"}:
+        candidate = candidate[1:-1].strip()
+    return candidate
+
+
+def _normalize_selector_text(text: str) -> str:
+    selector = _strip_wrapping_quotes(text).strip().rstrip(".,;")
+    return selector
+
+
+def _looks_like_explicit_selector(value: str) -> bool:
+    lowered = value.lower()
+    if lowered.startswith(("text=", "xpath=", "css=", "id=", "role=", "label=", "placeholder=")):
+        return True
+    if value.startswith("//"):
+        return True
+    return any(token in value for token in ("#", ".", "[", "]", ">", "=", ":", "/"))
+
+
 def _extract_form_name_value(text: str) -> str:
     quoted = _first_quoted(text)
     if quoted:
@@ -138,6 +322,40 @@ def _extract_form_name_value(text: str) -> str:
         normalized = normalized.replace("<time stamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
         return normalized
     return "QA_Form_{{NOW_YYYYMMDD_HHMMSS}}"
+
+
+def _extract_drag_field_label(text: str) -> str | None:
+    quoted = _first_quoted(text)
+    if quoted and "field" not in quoted.lower():
+        return quoted.strip()
+
+    lower = text.lower()
+    if "drag" not in lower:
+        return None
+
+    match = re.search(
+        r"(?:select|choose|pick|drag)\s+([a-z0-9][a-z0-9 _-]{1,60}?)\s+field\b",
+        lower,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        label = match.group(1).strip(" -_")
+        if label:
+            return " ".join(part.capitalize() for part in label.split())
+    return None
+
+
+def _drag_source_selector_from_label(label: str | None) -> str:
+    token = (label or "").strip()
+    lower = token.lower()
+    if not token:
+        return "{{selector.short_answer_source}}"
+    if any(mark in lower for mark in ("short answer", "short-answer", "short_answer")):
+        return "{{selector.short_answer_source}}"
+    if lower == "email":
+        return "{{selector.email_field_source}}"
+    escaped = token.replace('"', '\\"')
+    return f"[draggable='true']:has-text(\"{escaped}\")"
 
 
 def _enforce_login_sequence(steps: list[dict[str, Any]], max_steps: int) -> list[dict[str, Any]]:

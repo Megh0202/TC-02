@@ -17,8 +17,9 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000"
     admin_api_token: str = ""
 
-    max_steps_per_run: int = 20
+    max_steps_per_run: int = 300
     step_timeout_seconds: int = 60
+    drag_step_timeout_seconds: int = 120
     browser_mode: Literal["mock", "playwright", "mcp"] = "mock"
     playwright_browser: Literal["chromium", "firefox", "webkit"] = "chromium"
     playwright_headless: bool = True
@@ -30,6 +31,8 @@ class Settings(BaseSettings):
     drag_retry_radius_px: int = 40
     drag_validation_wait_ms: int = 300
     drag_mouse_steps: int = 24
+    drag_debug_log_enabled: bool = True
+    drag_debug_log_path: Path = Path("data/drag_debug.jsonl")
     browser_mcp_command: str = "npx"
     browser_mcp_package: str = "@playwright/mcp@latest"
     browser_mcp_npx_yes: bool = True
