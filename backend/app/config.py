@@ -47,6 +47,15 @@ class Settings(BaseSettings):
     selector_recovery_enabled: bool = True
     selector_recovery_attempts: int = 2
     selector_recovery_delay_ms: int = 350
+    auto_drag_pre_click_enabled: bool = True
+    auto_drag_post_wait_ms: int = 120
+    auto_login_wait_ms: int = 500
+    auto_create_confirm_wait_ms: int = 450
+    default_wait_ms: int = 450
+    planner_default_wait_ms: int = 1000
+    recovery_load_state_wait_ms: int = 10000
+    structured_selector_wait_ms: int = 6000
+    structured_options_wait_ms: int = 5000
 
     filesystem_mode: Literal["local", "mcp"] = "local"
     file_mcp_command: str = "npx"

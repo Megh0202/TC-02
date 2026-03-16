@@ -7,7 +7,12 @@ from typing import Any
 ACTION_TYPE_KEYS = ("type", "action", "step_type", "name", "tool")
 
 
-def normalize_plan_steps(raw_steps: Any, max_steps: int) -> list[dict[str, Any]]:
+def normalize_plan_steps(
+    raw_steps: Any,
+    max_steps: int,
+    *,
+    default_wait_ms: int = 1000,
+) -> list[dict[str, Any]]:
     if not isinstance(raw_steps, list):
         return []
 
@@ -17,7 +22,7 @@ def normalize_plan_steps(raw_steps: Any, max_steps: int) -> list[dict[str, Any]]
         if isinstance(raw_step, dict):
             step = _normalize_step(raw_step)
         elif isinstance(raw_step, str):
-            step = _normalize_string_step(raw_step)
+            step = _normalize_string_step(raw_step, default_wait_ms=default_wait_ms)
         if step is None:
             continue
         normalized.append(step)
@@ -27,15 +32,21 @@ def normalize_plan_steps(raw_steps: Any, max_steps: int) -> list[dict[str, Any]]
     return normalized
 
 
-def build_recovery_steps(task: str, max_steps: int) -> list[dict[str, Any]]:
+def build_recovery_steps(
+    task: str,
+    max_steps: int,
+    *,
+    load_state_wait_ms: int = 10000,
+    timeout_wait_ms: int = 1000,
+) -> list[dict[str, Any]]:
     url = _extract_url(task)
     if url:
         steps = [
             {"type": "navigate", "url": url},
-            {"type": "wait", "until": "load_state", "load_state": "load", "ms": 10000},
+            {"type": "wait", "until": "load_state", "load_state": "load", "ms": max(load_state_wait_ms, 0)},
         ]
     else:
-        steps = [{"type": "wait", "until": "timeout", "ms": 1000}]
+        steps = [{"type": "wait", "until": "timeout", "ms": max(timeout_wait_ms, 0)}]
     return steps[: max(1, max_steps)]
 
 
@@ -218,7 +229,7 @@ def _normalize_step(raw_step: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def _normalize_string_step(raw_step: str) -> dict[str, Any] | None:
+def _normalize_string_step(raw_step: str, *, default_wait_ms: int = 1000) -> dict[str, Any] | None:
     text = raw_step.strip()
     if not text:
         return None
@@ -229,7 +240,7 @@ def _normalize_string_step(raw_step: str) -> dict[str, Any] | None:
         return {"type": "navigate", "url": url}
 
     if "wait" in lower:
-        return {"type": "wait", "until": "timeout", "ms": 1000}
+        return {"type": "wait", "until": "timeout", "ms": max(default_wait_ms, 0)}
 
     if "click" in lower:
         target = text.split("click", 1)[-1].strip(" :.-")

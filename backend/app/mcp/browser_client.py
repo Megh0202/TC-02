@@ -968,8 +968,25 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
 
     async def verify_text(self, selector: str, match: str, value: str) -> str:
         context = self._active_context()
-        text = await context.page.locator(selector).first.text_content()
+        locator = context.page.locator(selector).first
+        text = await locator.text_content()
         actual = (text or "").strip()
+        if not actual:
+            try:
+                actual = (await locator.inner_text()).strip()
+            except Exception:
+                actual = ""
+        if not actual:
+            for descendant_selector in ("a", "[role='cell']", "td"):
+                try:
+                    descendant = locator.locator(descendant_selector).first
+                    if await descendant.count() == 0:
+                        continue
+                    actual = (await descendant.inner_text()).strip()
+                    if actual:
+                        break
+                except Exception:
+                    continue
 
         if match == "exact":
             is_match = actual == value
@@ -1780,7 +1797,22 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             f"  const selector = {json.dumps(selector)};"
             f"  const matchType = {json.dumps(match)};"
             f"  const expected = {json.dumps(value)};"
-            "  const actual = ((await page.locator(selector).first().textContent()) || '').trim();"
+            "  const locator = page.locator(selector).first();"
+            "  let actual = ((await locator.textContent()) || '').trim();"
+            "  if (!actual) {"
+            "    try { actual = ((await locator.innerText()) || '').trim(); }"
+            "    catch (error) {}"
+            "  }"
+            "  if (!actual) {"
+            "    for (const childSelector of ['a', '[role=\"cell\"]', 'td']) {"
+            "      try {"
+            "        const child = locator.locator(childSelector).first();"
+            "        if ((await child.count()) === 0) continue;"
+            "        actual = ((await child.innerText()) || (await child.textContent()) || '').trim();"
+            "        if (actual) break;"
+            "      } catch (error) {}"
+            "    }"
+            "  }"
             "  let isMatch = false;"
             "  if (matchType === 'exact') {"
             "    isMatch = actual === expected;"

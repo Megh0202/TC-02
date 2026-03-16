@@ -167,6 +167,8 @@ def _expand_drag_steps(
     steps: list[dict[str, object]],
     *,
     max_steps: int,
+    auto_drag_pre_click_enabled: bool = True,
+    auto_drag_post_wait_ms: int = 120,
 ) -> list[dict[str, object]]:
     """
     Expand each drag step into explicit actions so runtime and UI show:
@@ -194,14 +196,14 @@ def _expand_drag_steps(
             and str(prev.get("selector") or "").strip() == source_selector
         )
 
-        if not prev_is_same_click and len(expanded) < max_steps:
+        if auto_drag_pre_click_enabled and not prev_is_same_click and len(expanded) < max_steps:
             expanded.append({"type": "click", "selector": source_selector})
 
         if len(expanded) < max_steps:
             expanded.append(dict(step))
 
-        if len(expanded) < max_steps:
-            expanded.append({"type": "wait", "until": "timeout", "ms": 120})
+        if auto_drag_post_wait_ms > 0 and len(expanded) < max_steps:
+            expanded.append({"type": "wait", "until": "timeout", "ms": auto_drag_post_wait_ms})
 
     return expanded[:max_steps]
 
@@ -288,7 +290,12 @@ def build_app() -> FastAPI:
         _: None = Depends(require_admin_auth),
     ) -> RunState:
         raw_steps = [step.model_dump(exclude_none=True) for step in request.steps]
-        expanded_steps = _expand_drag_steps(raw_steps, max_steps=settings.max_steps_per_run)
+        expanded_steps = _expand_drag_steps(
+            raw_steps,
+            max_steps=settings.max_steps_per_run,
+            auto_drag_pre_click_enabled=settings.auto_drag_pre_click_enabled,
+            auto_drag_post_wait_ms=settings.auto_drag_post_wait_ms,
+        )
         expanded_request = RunCreateRequest.model_validate(
             {
                 "run_name": request.run_name,
@@ -342,8 +349,14 @@ def build_app() -> FastAPI:
         normalized_steps = normalize_plan_steps(
             raw_steps,
             max_steps=max(len(raw_steps), settings.max_steps_per_run, 1),
+            default_wait_ms=settings.planner_default_wait_ms,
         )
-        normalized_steps = _expand_drag_steps(normalized_steps, max_steps=settings.max_steps_per_run)
+        normalized_steps = _expand_drag_steps(
+            normalized_steps,
+            max_steps=settings.max_steps_per_run,
+            auto_drag_pre_click_enabled=settings.auto_drag_pre_click_enabled,
+            auto_drag_post_wait_ms=settings.auto_drag_post_wait_ms,
+        )
         if not normalized_steps:
             raise HTTPException(
                 status_code=422,
@@ -420,6 +433,8 @@ def build_app() -> FastAPI:
         expanded_steps = _expand_drag_steps(
             [step.model_dump(exclude_none=True) for step in run_request.steps],
             max_steps=settings.max_steps_per_run,
+            auto_drag_pre_click_enabled=settings.auto_drag_pre_click_enabled,
+            auto_drag_post_wait_ms=settings.auto_drag_post_wait_ms,
         )
         expanded_run_request = RunCreateRequest.model_validate(
             {
@@ -442,7 +457,15 @@ def build_app() -> FastAPI:
     ) -> PlanGenerateResponse:
         max_steps = request.max_steps or settings.max_steps_per_run
         max_steps = min(max_steps, settings.max_steps_per_run)
-        parsed_steps = parse_structured_task_steps(request.task, max_steps=max_steps)
+        parsed_steps = parse_structured_task_steps(
+            request.task,
+            max_steps=max_steps,
+            auto_login_wait_ms=settings.auto_login_wait_ms,
+            auto_create_confirm_wait_ms=settings.auto_create_confirm_wait_ms,
+            default_wait_ms=settings.default_wait_ms,
+            structured_selector_wait_ms=settings.structured_selector_wait_ms,
+            structured_options_wait_ms=settings.structured_options_wait_ms,
+        )
         if parsed_steps:
             validated = RunCreateRequest.model_validate(
                 {
@@ -500,12 +523,26 @@ def build_app() -> FastAPI:
             raise HTTPException(status_code=502, detail=f"Brain plan generation failed: {exc}") from exc
 
         try:
-            normalized_steps = normalize_plan_steps(payload.get("steps"), max_steps=max_steps)
+            normalized_steps = normalize_plan_steps(
+                payload.get("steps"),
+                max_steps=max_steps,
+                default_wait_ms=settings.planner_default_wait_ms,
+            )
             normalized_steps = _sanitize_plan_steps(normalized_steps, start_url=payload.get("start_url"))
             normalized_steps = _ensure_drag_step(request.task, normalized_steps)
-            normalized_steps = _expand_drag_steps(normalized_steps, max_steps=max_steps)
+            normalized_steps = _expand_drag_steps(
+                normalized_steps,
+                max_steps=max_steps,
+                auto_drag_pre_click_enabled=settings.auto_drag_pre_click_enabled,
+                auto_drag_post_wait_ms=settings.auto_drag_post_wait_ms,
+            )
             if not normalized_steps:
-                normalized_steps = build_recovery_steps(request.task, max_steps=max_steps)
+                normalized_steps = build_recovery_steps(
+                    request.task,
+                    max_steps=max_steps,
+                    load_state_wait_ms=settings.recovery_load_state_wait_ms,
+                    timeout_wait_ms=settings.planner_default_wait_ms,
+                )
             if not normalized_steps:
                 raise HTTPException(
                     status_code=422,

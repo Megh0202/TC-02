@@ -47,6 +47,28 @@ def test_structured_prompt_inserts_create_click_after_form_name_before_drag() ->
     assert steps[form_name_index + 3]["type"] == "drag"
 
 
+def test_structured_prompt_can_disable_auto_login_and_create_waits() -> None:
+    task = """
+1) Navigate to https://test.vitaone.io
+2) Type "qa@example.com" into email field
+3) Type "secret123" into password field
+4) Click "Create Form"
+5) In Form Name, type QA_Form_{{NOW_YYYYMMDD_HHMMSS}}
+6) Drag "Short answer" field into the form canvas
+"""
+    steps = parse_structured_task_steps(
+        task,
+        max_steps=20,
+        auto_login_wait_ms=0,
+        auto_create_confirm_wait_ms=0,
+    )
+
+    types = [step["type"] for step in steps]
+    assert types.count("wait") == 0
+    assert {"type": "click", "selector": "{{selector.login_button}}"} in steps
+    assert {"type": "click", "selector": "{{selector.create_form_confirm}}"} in steps
+
+
 def test_drag_step_uses_email_source_alias_when_email_field_is_requested() -> None:
     task = """
 1) Navigate to https://test.vitaone.io
@@ -103,3 +125,42 @@ def test_explicit_selector_lines_are_all_parsed_without_dropping_steps() -> None
         "source_selector": "[draggable='true']:has-text('Short answer')",
         "target_selector": "[data-testid='form-builder-canvas']",
     }
+
+
+def test_required_optional_form_editor_verification_expands_to_stable_wait_steps() -> None:
+    task = """
+1) Verify the Form editor shows all fields with correct required/optional settings
+"""
+    steps = parse_structured_task_steps(task, max_steps=10)
+
+    assert steps == []
+
+    structured_task = """
+1) Navigate to https://test.vitaone.io
+2) Verify the Form editor shows all fields with correct required/optional settings
+"""
+    steps = parse_structured_task_steps(structured_task, max_steps=10)
+
+    assert steps[1:] == [
+        {"type": "wait", "until": "selector_visible", "selector": "text=First Name", "ms": 6000},
+        {"type": "wait", "until": "selector_visible", "selector": "text=Email", "ms": 6000},
+        {"type": "wait", "until": "selector_visible", "selector": "text=Dropdown", "ms": 6000},
+        {
+            "type": "wait",
+            "until": "selector_visible",
+            "selector": ".form-row:has-text('First Name'):has-text('Required')",
+            "ms": 6000,
+        },
+        {
+            "type": "wait",
+            "until": "selector_visible",
+            "selector": ".form-row:has-text('Email'):has-text('Required')",
+            "ms": 6000,
+        },
+        {
+            "type": "wait",
+            "until": "selector_hidden",
+            "selector": ".form-row:has-text('Dropdown'):has-text('Required')",
+            "ms": 6000,
+        },
+    ]
