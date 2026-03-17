@@ -34,6 +34,9 @@ except ImportError:  # pragma: no cover - optional dependency in non-MCP mode
     stdio_client = None
 
 LOGGER = logging.getLogger("tekno.phantom.browser")
+_MOCK_SCREENSHOT_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO5xY4kAAAAASUVORK5CYII="
+)
 
 
 def _extract_drag_label(selector: str) -> str | None:
@@ -177,6 +180,10 @@ class BrowserMCPClient:
         target = selector or "page"
         baseline = baseline_path or "none"
         return f"Image verification passed on {target} (baseline={baseline}, threshold={threshold})"
+
+    async def capture_screenshot(self, selector: str | None = None) -> bytes:
+        await asyncio.sleep(0.05)
+        return _MOCK_SCREENSHOT_BYTES
 
 
 @dataclass
@@ -1038,6 +1045,12 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
             f"(baseline={baseline}, threshold={threshold}, difference={delta:.4f})"
         )
 
+    async def capture_screenshot(self, selector: str | None = None) -> bytes:
+        context = self._active_context()
+        if selector:
+            return await context.page.locator(selector).first.screenshot()
+        return await context.page.screenshot(full_page=True)
+
     async def _on_dialog(self, run_id: str, dialog: Any) -> None:
         context = self._runs.get(run_id)
         if not context:
@@ -1881,6 +1894,28 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             f"Image verification passed on {target} "
             f"(baseline={baseline}, threshold={threshold}, difference={delta:.4f})"
         )
+
+    async def capture_screenshot(self, selector: str | None = None) -> bytes:
+        if selector:
+            code = (
+                "async (page) => {"
+                f"  const bytes = await page.locator({json.dumps(selector)}).first().screenshot();"
+                "  return bytes.toString('base64');"
+                "}"
+            )
+        else:
+            code = (
+                "async (page) => {"
+                "  const bytes = await page.screenshot({ fullPage: true });"
+                "  return bytes.toString('base64');"
+                "}"
+            )
+
+        encoded = await self._run_code(code)
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except Exception as exc:
+            raise ValueError("Unable to decode screenshot data returned from Browser MCP") from exc
 
     def _active_context(self) -> _MCPPlaywrightRunContext:
         run_id = self._current_run_id.get()

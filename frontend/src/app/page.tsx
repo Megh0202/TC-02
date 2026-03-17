@@ -27,6 +27,7 @@ type RunState = {
   run_name: string;
   status: "pending" | "running" | "completed" | "failed" | "cancelled";
   summary?: string | null;
+  report_artifact?: string | null;
   steps: RuntimeStep[];
 };
 
@@ -34,6 +35,7 @@ type TestCaseState = {
   test_case_id: string;
   name: string;
   description?: string;
+  prompt?: string;
   start_url?: string | null;
   steps: Record<string, unknown>[];
   test_data?: JsonObject;
@@ -46,6 +48,7 @@ type TestCaseSummary = {
   test_case_id: string;
   name: string;
   description?: string;
+  prompt?: string;
   start_url?: string | null;
   step_count: number;
   created_at: string;
@@ -143,6 +146,13 @@ function formatPlanStep(step: Record<string, unknown>): string {
   return details ? `${typeLabel}: ${details}` : typeLabel;
 }
 
+function buildPromptFallbackFromSteps(steps: Record<string, unknown>[]): string {
+  if (!steps.length) return "";
+  return steps
+    .map((step, index) => `${index + 1}. ${formatPlanStep(step)}`)
+    .join("\n");
+}
+
 function parseJsonObject(raw: string, label: string): JsonObject {
   const text = raw
     .replace(/\u2018|\u2019|\u2032/g, "'")
@@ -203,6 +213,10 @@ export default function Home() {
     () => currentRun && !isTerminal(currentRun.status),
     [currentRun],
   );
+  const reportUrl = useMemo(() => {
+    if (!currentRun?.run_id || !currentRun?.report_artifact) return null;
+    return `${API_BASE_URL}/api/runs/${currentRun.run_id}/artifacts/report.html`;
+  }, [currentRun]);
   const planIsFresh = useMemo(() => {
     if (!planPreview) return false;
     const currentSignature = buildPlanSignature(prompt, testDataInput, selectorProfileInput);
@@ -278,7 +292,9 @@ export default function Home() {
   }, [loadTestCases]);
 
   useEffect(() => {
-    if (!currentRun || isTerminal(currentRun.status)) return;
+    if (!currentRun) return;
+    const shouldPoll = !isTerminal(currentRun.status) || !currentRun.report_artifact;
+    if (!shouldPoll) return;
 
     const interval = setInterval(async () => {
       try {
@@ -540,6 +556,7 @@ export default function Home() {
         body: JSON.stringify({
           name: normalizedName,
           description: testCaseDescription.trim(),
+          prompt: task || buildPromptFallbackFromSteps(plan.steps),
           start_url: plan.start_url ?? null,
           steps: plan.steps,
           test_data: testData,
@@ -565,6 +582,19 @@ export default function Home() {
     setRequestInfo(null);
     try {
       setRunningCaseId(testCaseId);
+      const detailResponse = await fetch(`${API_BASE_URL}/api/test-cases/${testCaseId}`, {
+        cache: "no-store",
+        headers: buildApiHeaders(),
+      });
+      if (detailResponse.ok) {
+        const detail = (await detailResponse.json()) as TestCaseState;
+        const savedPrompt = (detail.prompt ?? "").trim();
+        const fallbackPrompt = buildPromptFallbackFromSteps(detail.steps ?? []);
+        setPrompt(savedPrompt || fallbackPrompt);
+        setTestCaseName(detail.name ?? "");
+        setTestCaseDescription(detail.description ?? "");
+      }
+
       const response = await fetch(`${API_BASE_URL}/api/test-cases/${testCaseId}/run`, {
         method: "POST",
         headers: buildApiHeaders(),
@@ -853,9 +883,21 @@ export default function Home() {
                   <p className={styles.runName}>{currentRun.run_name}</p>
                   <p className={styles.metaLine}>Run ID: {currentRun.run_id}</p>
                 </div>
-                <p className={`${styles.statusPill} ${statusClass(currentRun.status)}`}>
-                  {currentRun.status}
-                </p>
+                <div className={styles.runHeaderActions}>
+                  {reportUrl ? (
+                    <a
+                      className={styles.secondaryButton}
+                      href={reportUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      View Report
+                    </a>
+                  ) : null}
+                  <p className={`${styles.statusPill} ${statusClass(currentRun.status)}`}>
+                    {currentRun.status}
+                  </p>
+                </div>
               </div>
 
               {currentRun.summary ? <p className={styles.summary}>{currentRun.summary}</p> : null}

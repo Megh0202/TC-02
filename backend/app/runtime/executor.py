@@ -1,6 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 import asyncio
+from html import escape
 import logging
 import re
 from collections.abc import Awaitable, Callable
@@ -319,13 +320,24 @@ class AgentExecutor:
             await self._browser.close_run(run_id)
             run.finished_at = utc_now()
             self._run_store.persist(run)
+            await self._write_html_report(run)
             self._run_store.clear_cancel(run_id)
+
+    async def _write_html_report(self, run: RunState) -> None:
+        try:
+            report_html = self._build_html_report(run)
+            report_path = await self._files.write_text_artifact(run.run_id, "report.html", report_html)
+            run.report_artifact = report_path
+            self._run_store.persist(run)
+        except Exception:
+            LOGGER.exception("Failed to write HTML report for run %s", run.run_id)
 
     async def _execute_step(self, run: RunState, step: StepRuntimeState) -> None:
         step.status = StepStatus.running
         step.started_at = utc_now()
         step.error = None
         step.message = None
+        step.failure_screenshot = None
 
         try:
             message = await asyncio.wait_for(
@@ -347,8 +359,23 @@ class AgentExecutor:
             else:
                 step.error = compact
             step.message = "Step failed"
+            await self._capture_failure_screenshot(run.run_id, step)
         finally:
             step.ended_at = utc_now()
+
+    async def _capture_failure_screenshot(self, run_id: str, step: StepRuntimeState) -> None:
+        try:
+            screenshot_name = f"step-{step.index:03d}-failed.png"
+            screenshot_bytes = await self._browser.capture_screenshot()
+            await self._files.write_bytes_artifact(run_id, screenshot_name, screenshot_bytes)
+            step.failure_screenshot = screenshot_name
+        except Exception as exc:
+            LOGGER.warning(
+                "Failed to capture screenshot for run %s step %s: %s",
+                run_id,
+                step.index,
+                self._compact_error(exc),
+            )
 
     async def _dispatch_step(self, run: RunState, raw_step: dict) -> str:
         step_type = raw_step.get("type")
@@ -1572,6 +1599,351 @@ class AgentExecutor:
             if domain:
                 return domain
         return None
+
+    @staticmethod
+    def _duration_seconds(started_at: datetime | None, ended_at: datetime | None) -> float | None:
+        if started_at is None or ended_at is None:
+            return None
+        return max((ended_at - started_at).total_seconds(), 0.0)
+
+    @staticmethod
+    def _format_seconds(value: float | None) -> str:
+        if value is None:
+            return "N/A"
+        return f"{value:.2f}"
+
+    @staticmethod
+    def _run_status_meta(status: RunStatus) -> tuple[str, str]:
+        if status == RunStatus.completed:
+            return "Passed", "run-passed"
+        if status == RunStatus.failed:
+            return "Failed", "run-failed"
+        return "Skipped", "run-skipped"
+
+    @staticmethod
+    def _step_status_meta(status: StepStatus) -> tuple[str, str]:
+        if status == StepStatus.completed:
+            return "Passed", "step-passed"
+        if status == StepStatus.failed:
+            return "Failed", "step-failed"
+        return "Skipped", "step-skipped"
+
+    @staticmethod
+    def _step_display_name(step: StepRuntimeState) -> str:
+        payload = step.input or {}
+        step_type = str(step.type).lower()
+
+        if step_type == "navigate":
+            return f"Navigate to {payload.get('url', '')}".strip()
+        if step_type == "click":
+            return f"Click {payload.get('selector', '')}".strip()
+        if step_type == "type":
+            return f"Type into {payload.get('selector', '')}".strip()
+        if step_type == "select":
+            selector = payload.get("selector", "")
+            value = payload.get("value", "")
+            return f"Select {value} in {selector}".strip()
+        if step_type == "drag":
+            source = payload.get("source_selector", "")
+            target = payload.get("target_selector", "")
+            return f"Drag {source} to {target}".strip()
+        if step_type == "scroll":
+            target = payload.get("target", "page")
+            direction = payload.get("direction", "down")
+            amount = payload.get("amount", 600)
+            return f"Scroll {target} {direction} by {amount}px".strip()
+        if step_type == "wait":
+            return f"Wait ({payload.get('until', 'timeout')})".strip()
+        if step_type == "handle_popup":
+            return f"Handle popup ({payload.get('policy', 'dismiss')})".strip()
+        if step_type == "verify_text":
+            selector = payload.get("selector", "")
+            value = payload.get("value", "")
+            return f"Verify text '{value}' on {selector}".strip()
+        if step_type == "verify_image":
+            selector = payload.get("selector") or "page"
+            return f"Verify image on {selector}".strip()
+
+        return str(step.type)
+
+    def _build_html_report(self, run: RunState) -> str:
+        run_status_label, run_status_class = self._run_status_meta(run.status)
+        run_duration = self._format_seconds(self._duration_seconds(run.started_at, run.finished_at))
+        total_tests = len(run.steps)
+        passed_tests = sum(1 for step in run.steps if step.status == StepStatus.completed)
+        failed_tests = sum(1 for step in run.steps if step.status == StepStatus.failed)
+        skipped_tests = total_tests - passed_tests - failed_tests
+
+        step_items: list[str] = []
+        for step in run.steps:
+            step_status_label, step_status_class = self._step_status_meta(step.status)
+            step_duration = self._format_seconds(self._duration_seconds(step.started_at, step.ended_at))
+            step_name = escape(self._step_display_name(step))
+
+            detail_parts: list[str] = []
+            if step.message:
+                detail_parts.append(f"Message: {step.message}")
+            if step.error:
+                detail_parts.append(f"Error: {step.error}")
+            detail_text = escape(" | ".join(detail_parts))
+            details_html = f'<div class="step-detail">{detail_text}</div>' if detail_text else ""
+            screenshot_html = ""
+            if step.status == StepStatus.failed and step.failure_screenshot:
+                href = escape(step.failure_screenshot)
+                screenshot_html = (
+                    '<div class="step-detail">'
+                    f'<a href="{href}" target="_blank" rel="noopener">View Screenshot</a>'
+                    "</div>"
+                )
+
+            step_items.append(
+                (
+                    '<li class="step-item">'
+                    f'<span class="tick {step_status_class}" aria-label="{escape(step_status_label)}">&#10003;</span>'
+                    f'<span class="step-name">{step_name}</span>'
+                    f'<span class="step-status">{escape(step_status_label)}</span>'
+                    f'<span class="step-time">{escape(step_duration)}s</span>'
+                    f"{details_html}"
+                    f"{screenshot_html}"
+                    "</li>"
+                )
+            )
+
+        steps_html = "\n".join(step_items) if step_items else '<li class="step-item">No steps executed.</li>'
+
+        return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Test Run Report - {escape(run.run_name)}</title>
+  <style>
+    :root {{
+      --bg: #f6f8fb;
+      --card: #ffffff;
+      --border: #dbe2ea;
+      --text: #1f2a37;
+      --muted: #6b7280;
+      --pass: #15803d;
+      --fail: #dc2626;
+      --skip: #ca8a04;
+    }}
+    body {{
+      margin: 0;
+      padding: 24px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+    }}
+    .report {{
+      max-width: 980px;
+      margin: 0 auto;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06);
+    }}
+    .header {{
+      padding: 16px 20px 10px;
+      border-bottom: 1px solid var(--border);
+    }}
+    h1 {{
+      margin: 0;
+      font-size: 20px;
+    }}
+    .meta {{
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .overall {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(120px, 1fr));
+      gap: 8px;
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--border);
+      background: #fafcff;
+    }}
+    .metric {{
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px 10px;
+      background: #ffffff;
+    }}
+    .metric-label {{
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }}
+    .metric-value {{
+      margin-top: 4px;
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text);
+    }}
+    .metric-pass .metric-value {{
+      color: #166534;
+    }}
+    .metric-fail .metric-value {{
+      color: #991b1b;
+    }}
+    .metric-skip .metric-value {{
+      color: #854d0e;
+    }}
+    details {{
+      border-top: 1px solid var(--border);
+    }}
+    details:first-of-type {{
+      border-top: none;
+    }}
+    summary {{
+      list-style: none;
+      cursor: pointer;
+      display: grid;
+      gap: 12px;
+      grid-template-columns: minmax(220px, 1.6fr) minmax(160px, 1fr) minmax(130px, 0.8fr);
+      align-items: center;
+      padding: 14px 20px;
+      user-select: none;
+    }}
+    summary::-webkit-details-marker {{
+      display: none;
+    }}
+    .summary-title {{
+      font-weight: 600;
+    }}
+    .status-cell {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }}
+    .status-pill {{
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+    }}
+    .run-passed {{
+      background: #dcfce7;
+      color: #166534;
+    }}
+    .run-failed {{
+      background: #fee2e2;
+      color: #991b1b;
+    }}
+    .run-skipped {{
+      background: #fef9c3;
+      color: #854d0e;
+    }}
+    .arrow {{
+      color: var(--muted);
+      transition: transform 0.15s ease;
+      display: inline-block;
+    }}
+    details[open] .arrow {{
+      transform: rotate(90deg);
+    }}
+    .seconds {{
+      font-weight: 600;
+    }}
+    .steps {{
+      margin: 0;
+      padding: 6px 20px 18px 20px;
+      list-style: none;
+      display: grid;
+      gap: 8px;
+    }}
+    .step-item {{
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      display: grid;
+      gap: 8px;
+      grid-template-columns: 18px minmax(180px, 1fr) minmax(80px, auto) minmax(80px, auto);
+      align-items: center;
+      background: #fbfdff;
+    }}
+    .tick {{
+      font-size: 15px;
+      font-weight: 800;
+      line-height: 1;
+    }}
+    .step-passed {{
+      color: var(--pass);
+    }}
+    .step-failed {{
+      color: var(--fail);
+    }}
+    .step-skipped {{
+      color: var(--skip);
+    }}
+    .step-name {{
+      font-size: 14px;
+    }}
+    .step-status,
+    .step-time {{
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+    }}
+    .step-detail {{
+      grid-column: 2 / -1;
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    @media (max-width: 820px) {{
+      .overall {{
+        grid-template-columns: repeat(2, minmax(120px, 1fr));
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <main class="report">
+    <section class="header">
+      <h1>Test Execution Report</h1>
+      <div class="meta">Run ID: {escape(run.run_id)}</div>
+    </section>
+    <section class="overall">
+      <div class="metric">
+        <div class="metric-label">Total Tests</div>
+        <div class="metric-value">{total_tests}</div>
+      </div>
+      <div class="metric metric-pass">
+        <div class="metric-label">Test Passed</div>
+        <div class="metric-value">{passed_tests}</div>
+      </div>
+      <div class="metric metric-fail">
+        <div class="metric-label">Test Failed</div>
+        <div class="metric-value">{failed_tests}</div>
+      </div>
+      <div class="metric metric-skip">
+        <div class="metric-label">Test Skipped</div>
+        <div class="metric-value">{skipped_tests}</div>
+      </div>
+    </section>
+    <details>
+      <summary>
+        <span class="summary-title">Test Case Name: {escape(run.run_name)}</span>
+        <span class="status-cell">
+          <span class="status-pill {run_status_class}">Status: {escape(run_status_label)}</span>
+          <span class="arrow" aria-hidden="true">&#9656;</span>
+        </span>
+        <span class="seconds">Execution Time (seconds): {escape(run_duration)}</span>
+      </summary>
+      <ul class="steps">
+        {steps_html}
+      </ul>
+    </details>
+  </main>
+</body>
+</html>
+"""
 
     @staticmethod
     def _build_summary(run) -> str:

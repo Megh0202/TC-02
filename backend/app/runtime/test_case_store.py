@@ -43,6 +43,7 @@ class InMemoryTestCaseStore:
         test_case = TestCaseState(
             name=request.name,
             description=request.description,
+            prompt=request.prompt,
             start_url=request.start_url,
             test_data=request.test_data,
             selector_profile=request.selector_profile,
@@ -66,6 +67,7 @@ class InMemoryTestCaseStore:
                     test_case_id=item.test_case_id,
                     name=item.name,
                     description=item.description,
+                    prompt=item.prompt,
                     start_url=item.start_url,
                     step_count=len(item.steps),
                     created_at=item.created_at,

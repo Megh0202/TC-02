@@ -320,6 +320,14 @@
   gap: 10px;
 }
 
+.runHeaderActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .runName {
   color: var(--ink-900);
   font-size: 18px;

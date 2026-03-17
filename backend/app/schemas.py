@@ -205,6 +205,7 @@ class StepImportResponse(BaseModel):
 class TestCaseCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     description: str = ""
+    prompt: str = ""
     start_url: str | None = None
     steps: list[ActionStep] = Field(min_length=1)
     test_data: dict[str, JsonScalar] = Field(default_factory=dict)
@@ -221,6 +222,11 @@ class TestCaseCreateRequest(BaseModel):
     @field_validator("description")
     @classmethod
     def normalize_description(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("prompt")
+    @classmethod
+    def normalize_prompt(cls, value: str) -> str:
         return value.strip()
 
     @field_validator("steps")
@@ -286,6 +292,7 @@ class TestCaseState(BaseModel):
     test_case_id: str = Field(default_factory=lambda: str(uuid4()))
     name: str
     description: str = ""
+    prompt: str = ""
     start_url: str | None = None
     test_data: dict[str, JsonScalar] = Field(default_factory=dict)
     selector_profile: dict[str, list[str]] = Field(default_factory=dict)
@@ -298,6 +305,7 @@ class TestCaseSummary(BaseModel):
     test_case_id: str
     name: str
     description: str = ""
+    prompt: str = ""
     start_url: str | None = None
     step_count: int = 0
     created_at: datetime
@@ -318,6 +326,7 @@ class StepRuntimeState(BaseModel):
     ended_at: datetime | None = None
     message: str | None = None
     error: str | None = None
+    failure_screenshot: str | None = None
 
 
 class RunState(BaseModel):
@@ -332,6 +341,7 @@ class RunState(BaseModel):
     finished_at: datetime | None = None
     steps: list[StepRuntimeState]
     summary: str | None = None
+    report_artifact: str | None = None
 
 
 class RunListResponse(BaseModel):

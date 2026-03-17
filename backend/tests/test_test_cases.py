@@ -14,6 +14,7 @@ def test_create_and_list_test_cases() -> None:
     payload = {
         "name": "Create_Form_01",
         "description": "Create form with short answer and save",
+        "prompt": "Open https://example.com and verify h1 contains Example",
         "start_url": "https://example.com",
         "steps": [
             {"type": "navigate", "url": "https://example.com"},
@@ -28,12 +29,14 @@ def test_create_and_list_test_cases() -> None:
         body = created.json()
         assert body["name"] == "Create_Form_01"
         assert body["description"] == "Create form with short answer and save"
+        assert body["prompt"] == "Open https://example.com and verify h1 contains Example"
         assert len(body["steps"]) == 3
 
         listed = client.get("/api/test-cases")
         assert listed.status_code == 200, listed.text
         items = listed.json()["items"]
         assert any(item["name"] == "Create_Form_01" for item in items)
+        assert any(item["prompt"] == "Open https://example.com and verify h1 contains Example" for item in items)
 
 
 def test_run_saved_test_case() -> None:
@@ -61,4 +64,3 @@ def test_run_saved_test_case() -> None:
         assert run["run_name"] == "Create_Form_01"
         assert run["status"] == "completed"
         assert len(run["steps"]) == 2
-

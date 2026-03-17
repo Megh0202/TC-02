@@ -23,6 +23,9 @@ class FileSystemClient(Protocol):
     async def write_text_artifact(self, run_id: str, filename: str, content: str) -> str:
         ...
 
+    async def write_bytes_artifact(self, run_id: str, filename: str, content: bytes) -> str:
+        ...
+
     async def exists(self, path: str) -> bool:
         ...
 
@@ -43,6 +46,12 @@ class LocalFileSystemClient:
         run_path = await self.ensure_run_dir(run_id)
         path = (run_path / filename).resolve()
         await asyncio.to_thread(path.write_text, content, "utf-8")
+        return str(path)
+
+    async def write_bytes_artifact(self, run_id: str, filename: str, content: bytes) -> str:
+        run_path = await self.ensure_run_dir(run_id)
+        path = (run_path / filename).resolve()
+        await asyncio.to_thread(path.write_bytes, content)
         return str(path)
 
     async def exists(self, path: str) -> bool:
@@ -99,6 +108,12 @@ class MCPFileSystemClient:
             "write_file",
             {"path": path.as_posix(), "content": content},
         )
+        return str(path)
+
+    async def write_bytes_artifact(self, run_id: str, filename: str, content: bytes) -> str:
+        run_path = await self.ensure_run_dir(run_id)
+        path = (run_path / filename).resolve()
+        await asyncio.to_thread(path.write_bytes, content)
         return str(path)
 
     async def exists(self, path: str) -> bool:

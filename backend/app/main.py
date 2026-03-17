@@ -9,6 +9,7 @@ from typing import Annotated
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Header, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from app.brain.http_client import HttpBrainClient
 from app.config import Settings, get_settings
@@ -582,6 +583,21 @@ def build_app() -> FastAPI:
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         return run
+
+    @app.get("/api/runs/{run_id}/artifacts/{artifact_name:path}")
+    async def get_run_artifact(run_id: str, artifact_name: str) -> FileResponse:
+        run = run_store.get(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+        run_dir = (settings.artifact_root / run_id).resolve()
+        artifact_path = (run_dir / artifact_name).resolve()
+        if not artifact_path.is_relative_to(run_dir):
+            raise HTTPException(status_code=400, detail="Invalid artifact path")
+        if not artifact_path.exists() or not artifact_path.is_file():
+            raise HTTPException(status_code=404, detail="Artifact not found")
+
+        return FileResponse(artifact_path)
 
     @app.post("/api/runs/{run_id}/cancel", response_model=CancelRunResponse)
     async def cancel_run(run_id: str, _: None = Depends(require_admin_auth)) -> CancelRunResponse:
