@@ -164,3 +164,107 @@ def test_required_optional_form_editor_verification_expands_to_stable_wait_steps
             "ms": 6000,
         },
     ]
+
+
+def test_workflow_prompt_inserts_top_left_navigation_and_workflow_steps() -> None:
+    task = """
+1) Launch the application - https://test.vitaone.io
+2) Enter email - balasubramanian.r@teknotrait.com
+3) Enter password - PasswordVitaone1@
+4) click on log in button
+5) Verify that admin is logged in successfully and 'Create Form' button is visible
+6) Change the Module from Forms to Workflows
+7) Verify 'Create Workflow' button should be available
+8) Click on 'Create Workflow' button
+9) Enter Workflow Name in the following format - "QA_Auto_Workflow_<timestamp>" where timestamp is the current date time stamp
+10) Enter description as - "This is Automation testing workflow with test data"
+11) Click on Save button to save the Workflow
+"""
+    steps = parse_structured_task_steps(task, max_steps=20)
+
+    assert steps[:8] == [
+        {"type": "navigate", "url": "https://test.vitaone.io"},
+        {
+            "type": "type",
+            "selector": "{{selector.email}}",
+            "text": "balasubramanian.r@teknotrait.com",
+            "clear_first": True,
+        },
+        {
+            "type": "type",
+            "selector": "{{selector.password}}",
+            "text": "PasswordVitaone1@",
+            "clear_first": True,
+        },
+        {"type": "click", "selector": "{{selector.login_button}}"},
+        {"type": "wait", "until": "selector_visible", "selector": "{{selector.create_form}}", "ms": 6000},
+        {"type": "click", "selector": "{{selector.top_left_corner}}"},
+        {"type": "wait", "until": "timeout", "ms": 400},
+        {"type": "click", "selector": "{{selector.workflows_module}}"},
+    ]
+    assert steps[8] == {
+        "type": "wait",
+        "until": "selector_visible",
+        "selector": "{{selector.create_workflow}}",
+        "ms": 6000,
+    }
+    assert steps[9] == {"type": "click", "selector": "{{selector.create_workflow}}"}
+    assert steps[10] == {
+        "type": "type",
+        "selector": "{{selector.workflow_name}}",
+        "text": "QA_Auto_Workflow_{{NOW_YYYYMMDD_HHMMSS}}",
+        "clear_first": True,
+    }
+    assert steps[11] == {
+        "type": "type",
+        "selector": "{{selector.workflow_description}}",
+        "text": "This is Automation testing workflow with test data",
+        "clear_first": True,
+    }
+    assert steps[12] == {"type": "click", "selector": "{{selector.save_workflow}}"}
+
+
+def test_workflow_status_prompt_continues_after_creation_without_losing_context() -> None:
+    task = """
+1) Verify the confirmation message - "Workflow has been created"
+2) Click on 'Add Status' button
+3) Click on 'New status' tab on the Pop up
+4) Enter Status name as - InitialState_<timestamp> where timestamp is the current date time stamp
+5) Select Status category as - "To Do"
+6) Click on Save button
+7) Create another state by Clicking on 'Add Status' button
+8) Click on 'New status' tab on the Pop up
+9) Enter Status name as - SubmittedState_<timestamp> where timestamp is the current date time stamp
+10) Select Status category as - "To Do"
+11) Click on Save button
+"""
+    steps = parse_structured_task_steps(task, max_steps=30)
+
+    assert steps[0] == {
+        "type": "wait",
+        "until": "selector_visible",
+        "selector": "{{selector.add_status_button}}",
+        "ms": 6000,
+    }
+    assert steps[1] == {"type": "click", "selector": "{{selector.add_status_button}}"}
+    assert steps[2] == {"type": "click", "selector": "{{selector.new_status_tab}}"}
+    assert steps[3] == {
+        "type": "type",
+        "selector": "{{selector.status_name}}",
+        "text": "InitialState_{{NOW_YYYYMMDD_HHMMSS}}",
+        "clear_first": True,
+    }
+    assert steps[4] == {"type": "click", "selector": "{{selector.status_category_dropdown}}"}
+    assert steps[5] == {"type": "click", "selector": "{{selector.status_category_todo}}"}
+    assert steps[6] == {"type": "click", "selector": "{{selector.save_status}}"}
+    assert steps[7] == {"type": "click", "selector": "{{selector.add_status_button}}"}
+    assert steps[8] == {"type": "click", "selector": "{{selector.new_status_tab}}"}
+    assert steps[9] == {
+        "type": "type",
+        "selector": "{{selector.status_name}}",
+        "text": "SubmittedState_{{NOW_YYYYMMDD_HHMMSS}}",
+        "clear_first": True,
+    }
+    assert steps[10] == {"type": "click", "selector": "{{selector.status_category_dropdown}}"}
+    assert steps[11] == {"type": "click", "selector": "{{selector.status_category_todo}}"}
+    assert steps[12] == {"type": "click", "selector": "{{selector.save_status}}"}

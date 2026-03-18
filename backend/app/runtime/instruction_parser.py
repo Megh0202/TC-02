@@ -44,6 +44,7 @@ def parse_structured_task_steps(
     last_drag_source_selector: str | None = None
     dropdown_options_mode = False
     pending_option_type_choice: str | None = None
+    status_creation_mode = False
     for line in instruction_lines:
         lower = line.lower()
         normalized_lower = re.sub(r"[^a-z0-9\s]", " ", lower)
@@ -94,6 +95,19 @@ def parse_structured_task_steps(
                 and parsed_step.get("selector") == "{{selector.form_label}}"
             ):
                 parsed_step["selector"] = "{{selector.dropdown_option_label}}"
+            if (
+                status_creation_mode
+                and parsed_step.get("type") == "click"
+                and parsed_step.get("selector") == "{{selector.save_form}}"
+            ):
+                parsed_step["selector"] = "{{selector.save_status}}"
+            if parsed_step.get("selector") in {
+                "{{selector.add_status_button}}",
+                "{{selector.new_status_tab}}",
+                "{{selector.status_name}}",
+                "{{selector.status_category_dropdown}}",
+            }:
+                status_creation_mode = True
             steps.append(parsed_step)
             if pending_option_type_choice and len(steps) < max_steps:
                 steps.append({"type": "click", "selector": "{{selector.dropdown_option_enter_manual}}"})
@@ -104,11 +118,18 @@ def parse_structured_task_steps(
                 and parsed_step.get("selector") == "{{selector.save_form}}"
             ):
                 dropdown_options_mode = False
+            if (
+                status_creation_mode
+                and parsed_step.get("type") == "click"
+                and parsed_step.get("selector") == "{{selector.save_status}}"
+            ):
+                status_creation_mode = False
             if len(steps) >= max_steps:
                 break
         if len(steps) >= max_steps:
             break
     steps = _enforce_login_sequence(steps, max_steps=max_steps, auto_login_wait_ms=auto_login_wait_ms)
+    steps = _enforce_workflow_navigation_sequence(steps, max_steps=max_steps)
     steps = _enforce_form_create_sequence(
         steps,
         max_steps=max_steps,
@@ -184,7 +205,7 @@ def _parse_line(
         if value:
             return {"type": "type", "selector": "{{selector.password}}", "text": value, "clear_first": True}
 
-    if "verify" in lower and "create form" in lower and "visible" in lower:
+    if "create form" in lower and any(token in lower for token in ("visible", "available")):
         return {
             "type": "wait",
             "until": "selector_visible",
@@ -192,12 +213,62 @@ def _parse_line(
             "ms": max(structured_selector_wait_ms, 0),
         }
 
+    if "top left" in lower and any(token in lower for token in ("click", "corner")):
+        return {"type": "click", "selector": "{{selector.top_left_corner}}"}
+
+    if "workflows" in lower and any(token in lower for token in ("change module", "change the module", "navigate", "open", "switch", "go to")):
+        return {"type": "click", "selector": "{{selector.workflows_module}}"}
+
+    if "create workflow" in lower and any(token in lower for token in ("visible", "available")):
+        return {
+            "type": "wait",
+            "until": "selector_visible",
+            "selector": "{{selector.create_workflow}}",
+            "ms": max(structured_selector_wait_ms, 0),
+        }
+
+    if "confirmation message" in lower and "workflow has been created" in lower:
+        return {
+            "type": "wait",
+            "until": "selector_visible",
+            "selector": "{{selector.add_status_button}}",
+            "ms": max(structured_selector_wait_ms, 0),
+        }
+
     if "click" in lower and "create form" in lower:
         return {"type": "click", "selector": "{{selector.create_form}}"}
+
+    if "click" in lower and "create workflow" in lower:
+        return {"type": "click", "selector": "{{selector.create_workflow}}"}
+
+    if "click" in lower and "add status" in lower:
+        return {"type": "click", "selector": "{{selector.add_status_button}}"}
+
+    if "click" in lower and "new status" in lower and "tab" in lower:
+        return {"type": "click", "selector": "{{selector.new_status_tab}}"}
 
     if "form name" in lower and any(token in lower for token in ("enter", "type")):
         value = _extract_form_name_value(line)
         return {"type": "type", "selector": "{{selector.form_name}}", "text": value, "clear_first": True}
+
+    if "workflow name" in lower and any(token in lower for token in ("enter", "type")):
+        value = _extract_workflow_name_value(line)
+        return {"type": "type", "selector": "{{selector.workflow_name}}", "text": value, "clear_first": True}
+
+    if "description" in lower and any(token in lower for token in ("enter", "type")):
+        value = _extract_description_value(line) or "This is Automation testing workflow with test data"
+        return {"type": "type", "selector": "{{selector.workflow_description}}", "text": value, "clear_first": True}
+
+    if "status name" in lower and any(token in lower for token in ("enter", "type")):
+        value = _extract_status_name_value(line)
+        return {"type": "type", "selector": "{{selector.status_name}}", "text": value, "clear_first": True}
+
+    if "status category" in lower and any(token in lower for token in ("select", "choose")):
+        category = _extract_status_category_value(line) or "To Do"
+        return [
+            {"type": "click", "selector": "{{selector.status_category_dropdown}}"},
+            {"type": "click", "selector": _status_category_option_selector(category)},
+        ]
 
     if "verify" in lower and "form" in lower and "top" in lower and "list" in lower:
         return {
@@ -314,6 +385,9 @@ def _parse_line(
     ):
         return {"type": "click", "selector": "{{selector.required_checkbox}}"}
 
+    if "click" in lower and "save" in lower and "workflow" in lower:
+        return {"type": "click", "selector": "{{selector.save_workflow}}"}
+
     if "click" in lower and "save" in lower:
         return {"type": "click", "selector": "{{selector.save_form}}"}
 
@@ -384,10 +458,26 @@ def _parse_explicit_click(line: str) -> dict[str, Any] | None:
     lowered_target = normalized_target.lower()
 
     if not _looks_like_explicit_selector(normalized_target):
+        if "log in" in lowered_target or "login" in lowered_target or "sign in" in lowered_target:
+            return {"type": "click", "selector": "{{selector.login_button}}"}
         if "create form" in lowered_target:
             return {"type": "click", "selector": "{{selector.create_form}}"}
+        if "create workflow" in lowered_target:
+            return {"type": "click", "selector": "{{selector.create_workflow}}"}
+        if "add status" in lowered_target:
+            return {"type": "click", "selector": "{{selector.add_status_button}}"}
+        if "new status" in lowered_target and "tab" in lowered_target:
+            return {"type": "click", "selector": "{{selector.new_status_tab}}"}
+        if "top left corner" in lowered_target:
+            return {"type": "click", "selector": "{{selector.top_left_corner}}"}
+        if "workflows" == lowered_target or "workflow module" in lowered_target or "workflows module" in lowered_target:
+            return {"type": "click", "selector": "{{selector.workflows_module}}"}
         if "back button" in lowered_target or lowered_target == "back":
             return {"type": "click", "selector": "{{selector.back_button}}"}
+        if "save" in lowered_target and "workflow" in lowered_target:
+            return {"type": "click", "selector": "{{selector.save_workflow}}"}
+        if "save" in lowered_target and "status" in lowered_target:
+            return {"type": "click", "selector": "{{selector.save_status}}"}
         if "save" in lowered_target:
             return {"type": "click", "selector": "{{selector.save_form}}"}
         if "required" in lowered_target:
@@ -448,6 +538,54 @@ def _extract_form_name_value(text: str) -> str:
         normalized = normalized.replace("<time stamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
         return normalized
     return "QA_Form_{{NOW_YYYYMMDD_HHMMSS}}"
+
+
+def _extract_workflow_name_value(text: str) -> str:
+    quoted = _first_quoted(text)
+    if quoted:
+        normalized = quoted.replace("<timestamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
+        normalized = normalized.replace("<time stamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
+        normalized = normalized.replace("current date time stamp", "{{NOW_YYYYMMDD_HHMMSS}}")
+        return normalized
+    lowered = text.lower()
+    if "qa_auto_workflow" in lowered:
+        return "QA_Auto_Workflow_{{NOW_YYYYMMDD_HHMMSS}}"
+    return "QA_Auto_Workflow_{{NOW_YYYYMMDD_HHMMSS}}"
+
+
+def _extract_description_value(text: str) -> str | None:
+    quoted = _first_quoted(text)
+    if quoted:
+        return quoted
+    return _after_delimiter(text)
+
+
+def _extract_status_name_value(text: str) -> str:
+    quoted = _first_quoted(text)
+    if quoted:
+        normalized = quoted.replace("<timestamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
+        normalized = normalized.replace("<time stamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
+        normalized = normalized.replace("current date time stamp", "{{NOW_YYYYMMDD_HHMMSS}}")
+        return normalized
+    lowered = text.lower()
+    if "submittedstate" in lowered:
+        return "SubmittedState_{{NOW_YYYYMMDD_HHMMSS}}"
+    return "InitialState_{{NOW_YYYYMMDD_HHMMSS}}"
+
+
+def _extract_status_category_value(text: str) -> str | None:
+    quoted = _first_quoted(text)
+    if quoted:
+        return quoted
+    return _after_delimiter(text)
+
+
+def _status_category_option_selector(category: str) -> str:
+    token = category.strip().lower()
+    if token == "to do":
+        return "{{selector.status_category_todo}}"
+    escaped = category.replace('"', '\\"')
+    return f"text={escaped}"
 
 
 def _extract_drag_field_label(text: str) -> str | None:
@@ -578,4 +716,38 @@ def _enforce_form_create_sequence(
     if auto_create_confirm_wait_ms > 0:
         create_sequence.append({"type": "wait", "until": "timeout", "ms": auto_create_confirm_wait_ms})
     merged = steps[: form_name_index + 1] + create_sequence + steps[form_name_index + 1 :]
+    return merged[:max_steps]
+
+
+def _enforce_workflow_navigation_sequence(
+    steps: list[dict[str, Any]],
+    *,
+    max_steps: int,
+) -> list[dict[str, Any]]:
+    workflow_click_index = next(
+        (
+            idx
+            for idx, step in enumerate(steps)
+            if step.get("type") == "click" and str(step.get("selector", "")).strip() == "{{selector.workflows_module}}"
+        ),
+        None,
+    )
+    if workflow_click_index is None:
+        return steps
+
+    has_top_left_before = any(
+        step.get("type") == "click" and str(step.get("selector", "")).strip() == "{{selector.top_left_corner}}"
+        for step in steps[:workflow_click_index]
+    )
+    if has_top_left_before:
+        return steps
+
+    merged = (
+        steps[:workflow_click_index]
+        + [
+            {"type": "click", "selector": "{{selector.top_left_corner}}"},
+            {"type": "wait", "until": "timeout", "ms": 400},
+        ]
+        + steps[workflow_click_index:]
+    )
     return merged[:max_steps]

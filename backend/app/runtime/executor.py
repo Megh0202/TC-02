@@ -40,8 +40,15 @@ DEFAULT_SELECTOR_PROFILE: dict[str, list[str]] = {
     ],
     "login_button": [
         "button[name='login']",
+        "button:has-text('Log In')",
+        "button:has-text('Login')",
+        "button:has-text('Sign In')",
+        "[role='button']:has-text('Log In')",
+        "[role='button']:has-text('Login')",
         "button[type='submit']",
+        "input[type='submit']",
         "text=Sign In",
+        "text=Log In",
         "text=Login",
     ],
     "create_form": [
@@ -49,6 +56,100 @@ DEFAULT_SELECTOR_PROFILE: dict[str, list[str]] = {
         "button#create_form",
         "button:has-text('Create Form')",
         "[role='button']:has-text('Create Form')",
+    ],
+    "top_left_corner": [
+        "header button[aria-label*='menu']",
+        "header button[aria-label*='navigation']",
+        "header button[aria-label*='sidebar']",
+        "header button:first-of-type",
+        "[role='banner'] button:first-of-type",
+    ],
+    "workflows_module": [
+        "a:has-text('Workflows')",
+        "button:has-text('Workflows')",
+        "[role='menuitem']:has-text('Workflows')",
+        "[role='link']:has-text('Workflows')",
+        "text=Workflows",
+    ],
+    "create_workflow": [
+        "button:has-text('Create Workflow')",
+        "[role='button']:has-text('Create Workflow')",
+        "a:has-text('Create Workflow')",
+        "text=Create Workflow",
+    ],
+    "workflow_confirmation": [
+        "[role='alert']:has-text('Workflow has been created')",
+        "[role='status']:has-text('Workflow has been created')",
+        ".toast:has-text('Workflow has been created')",
+        ".notification:has-text('Workflow has been created')",
+        "text=Workflow has been created",
+    ],
+    "workflow_name": [
+        "input[name='workflowName']",
+        "input[name='name']",
+        "input#workflowName",
+        "input#workflow-name",
+        "input[placeholder*='Workflow Name']",
+        "input[aria-label*='Workflow Name']",
+    ],
+    "workflow_description": [
+        "textarea[name='description']",
+        "textarea[placeholder*='Description']",
+        "textarea[aria-label*='Description']",
+        "input[name='description']",
+        "input[placeholder*='Description']",
+    ],
+    "save_workflow": [
+        "div[role='dialog'] button:has-text('Save')",
+        "div[role='dialog'] [role='button']:has-text('Save')",
+        "button[type='submit']:has-text('Save')",
+        "button:has-text('Save')",
+        "[role='button']:has-text('Save')",
+    ],
+    "add_status_button": [
+        "button:has-text('Add Status')",
+        "[role='button']:has-text('Add Status')",
+        "a:has-text('Add Status')",
+        "text=Add Status",
+    ],
+    "new_status_tab": [
+        "[role='tab']:has-text('New status')",
+        "button:has-text('New status')",
+        "[role='button']:has-text('New status')",
+        "text=New status",
+    ],
+    "status_name": [
+        "div[role='dialog'] input[name='statusName']",
+        "div[role='dialog'] input#statusName",
+        "div[role='dialog'] input[placeholder*='Status Name']",
+        "div[role='dialog'] input[placeholder*='status name']",
+        "div[role='dialog'] input[placeholder*='status']",
+        "div[role='dialog'] input[aria-label*='Status Name']",
+        "div[role='dialog'] input[aria-label*='status name']",
+        "input[name='statusName']",
+    ],
+    "status_category_dropdown": [
+        "div[role='dialog'] [role='combobox']",
+        "div[role='dialog'] [aria-haspopup='listbox']",
+        "div[role='dialog'] button:has-text('Select category')",
+        "div[role='dialog'] input[placeholder*='category']",
+        "div[role='dialog'] button:has-text('To Do')",
+        "text=Select category",
+    ],
+    "status_category_todo": [
+        "div[role='listbox'] [role='option']:has-text('To Do')",
+        "div[role='dialog'] [role='option']:has-text('To Do')",
+        "div[role='dialog'] li:has-text('To Do')",
+        "div[role='dialog'] div:has-text('To Do')",
+        "[role='option']:has-text('To Do')",
+        "text=To Do",
+    ],
+    "save_status": [
+        "div[role='dialog'] button:has-text('Save')",
+        "div[role='dialog'] [role='button']:has-text('Save')",
+        "div[role='dialog'] button[type='submit']",
+        "button:has-text('Save')",
+        "[role='button']:has-text('Save')",
     ],
     "create_form_confirm": [
         "[role='dialog'] button:has-text('Create')",
@@ -685,6 +786,12 @@ class AgentExecutor:
                 keys.insert(0, "password")
             if "qa_form" in hint_lower or "form" in hint_lower and "name" in hint_lower:
                 keys.insert(0, "form_name")
+            if "qa_auto_workflow" in hint_lower or "workflow" in hint_lower and "name" in hint_lower:
+                keys.insert(0, "workflow_name")
+            if "description" in hint_lower:
+                keys.insert(0, "workflow_description")
+            if "initialstate_" in hint_lower or "submittedstate_" in hint_lower or "status" in hint_lower and "name" in hint_lower:
+                keys.insert(0, "status_name")
             if "first name" in hint_lower or "label" in hint_lower:
                 keys.insert(0, "form_label")
 
@@ -699,6 +806,12 @@ class AgentExecutor:
                 keys.insert(0, "username")
             if "formname" in selector_lower or "form_name" in selector_lower or "form name" in selector_lower:
                 keys.insert(0, "form_name")
+            if "workflowname" in selector_lower or "workflow_name" in selector_lower or "workflow name" in selector_lower:
+                keys.insert(0, "workflow_name")
+            if "workflow_description" in selector_lower or "description" in selector_lower:
+                keys.insert(0, "workflow_description")
+            if "status_name" in selector_lower or "status name" in selector_lower or "statusname" in selector_lower:
+                keys.insert(0, "status_name")
             if "label" in selector_lower:
                 keys.insert(0, "form_label")
             if "dropdown_option_label" in selector_lower:
@@ -712,10 +825,28 @@ class AgentExecutor:
                 keys.insert(0, "login_button")
             if "create form" in selector_lower or "create_form" in selector_lower or "createform" in selector_lower:
                 keys.insert(0, "create_form")
+            if "create workflow" in selector_lower or "create_workflow" in selector_lower or "createworkflow" in selector_lower:
+                keys.insert(0, "create_workflow")
+            if "add status" in selector_lower or "add_status" in selector_lower or "addstatus" in selector_lower:
+                keys.insert(0, "add_status_button")
+            if "new status" in selector_lower or "new_status" in selector_lower or "newstatus" in selector_lower:
+                keys.insert(0, "new_status_tab")
+            if "top_left_corner" in selector_lower or "top left corner" in selector_lower:
+                keys.insert(0, "top_left_corner")
+            if "workflows_module" in selector_lower or selector_lower.strip() == "workflows":
+                keys.insert(0, "workflows_module")
             if "form_list_first_name" in selector_lower:
                 keys.insert(0, "form_list_first_name")
             if "back button" in selector_lower or "selector.back_button" in selector_lower or selector_lower.strip() == "back":
                 keys.insert(0, "back_button")
+            if "save workflow" in selector_lower or "save_workflow" in selector_lower or "saveworkflow" in selector_lower:
+                keys.insert(0, "save_workflow")
+            if "save status" in selector_lower or "save_status" in selector_lower or "savestatus" in selector_lower:
+                keys.insert(0, "save_status")
+            if "status_category_todo" in selector_lower or "to do" == selector_lower.strip():
+                keys.insert(0, "status_category_todo")
+            if "status_category_dropdown" in selector_lower or "select category" in selector_lower or "status category" in selector_lower:
+                keys.insert(0, "status_category_dropdown")
             if "save form" in selector_lower or "save_form" in selector_lower or "saveform" in selector_lower:
                 keys.insert(0, "save_form")
             if any(token in selector_lower for token in ("required", "checkbox")):
@@ -756,17 +887,31 @@ class AgentExecutor:
             hint_lower = (text_hint or "").lower()
             if any(token in hint_lower for token in ("create form", "create_form", "createform")):
                 keys.insert(0, "create_form")
+            if any(token in hint_lower for token in ("create workflow", "create_workflow", "createworkflow")):
+                keys.insert(0, "create_workflow")
+            if any(token in hint_lower for token in ("workflow has been created",)):
+                keys.insert(0, "workflow_confirmation")
             if any(token in hint_lower for token in ("login", "sign in", "signin", "log in")):
                 keys.insert(0, "login_button")
             if any(token in hint_lower for token in ("save", "save form", "save_form")):
                 keys.insert(0, "save_form")
+            if any(token in hint_lower for token in ("save workflow", "save_workflow")):
+                keys.insert(0, "save_workflow")
+            if any(token in hint_lower for token in ("save status", "save_status")):
+                keys.insert(0, "save_status")
             if "create form" in selector_lower or "create_form" in selector_lower or "createform" in selector_lower:
                 keys.insert(0, "create_form")
+            if "create workflow" in selector_lower or "create_workflow" in selector_lower or "createworkflow" in selector_lower:
+                keys.insert(0, "create_workflow")
+            if "workflow_confirmation" in selector_lower or "workflow has been created" in selector_lower:
+                keys.insert(0, "workflow_confirmation")
             if "form_list_first_row" in selector_lower:
                 keys.insert(0, "form_list_first_row")
         if step_type == "wait":
             if "dropdown_options_section" in selector_lower:
                 keys.insert(0, "dropdown_options_section")
+            if "create_workflow" in selector_lower or "create workflow" in selector_lower:
+                keys.insert(0, "create_workflow")
 
         ordered_keys = self._dedupe(keys)
         candidates: list[str] = []
@@ -913,6 +1058,13 @@ class AgentExecutor:
                 "text=+",
             )
             filtered = [c for c in candidates if any(m in c.lower() for m in preferred_markers)]
+            return filtered or candidates
+
+        if key == "status_category_todo":
+            filtered = [
+                c for c in candidates
+                if "to do" in c.lower() and "<option" not in c.lower() and "text=to do" not in c.lower()
+            ]
             return filtered or candidates
 
         if key == "form_label":
