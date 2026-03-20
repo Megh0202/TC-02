@@ -23,6 +23,20 @@ def test_structured_prompt_inserts_login_before_create_form_verify() -> None:
     assert any(step.get("selector") == "{{selector.save_form}}" for step in steps if step["type"] == "click")
 
 
+def test_workflow_prompt_without_explicit_login_click_still_inserts_login() -> None:
+    task = """
+1) Launch the application - https://test.vitaone.io
+2) Enter email - balasubramanian.r@teknotrait.com
+3) Enter password - PasswordVitaone1@
+4) Verify that admin is logged in successfully and 'Create Form' button is visible
+5) Change the Module from Forms to Workflows
+"""
+    steps = parse_structured_task_steps(task, max_steps=20)
+
+    assert steps[3] == {"type": "click", "selector": "{{selector.login_button}}"}
+    assert steps[4]["type"] in {"wait", "click"}
+
+
 def test_structured_prompt_inserts_create_click_after_form_name_before_drag() -> None:
     task = """
 1) Navigate to https://test.vitaone.io
@@ -268,3 +282,121 @@ def test_workflow_status_prompt_continues_after_creation_without_losing_context(
     assert steps[10] == {"type": "click", "selector": "{{selector.status_category_dropdown}}"}
     assert steps[11] == {"type": "click", "selector": "{{selector.status_category_todo}}"}
     assert steps[12] == {"type": "click", "selector": "{{selector.save_status}}"}
+
+
+def test_workflow_transition_prompt_extends_existing_workflow_flow() -> None:
+    task = """
+1) Click on 'Transition' button
+2) Select InitialState<timestamp> value from the "From status" dropdown
+3) Select SubmittedState<timestamp> value from the "To status" dropdown
+4) Enter Transition Name as Tranisition_<timestamp> where timestamp is the current date time stamp
+5) Click on Save button
+6) Verify that the newly created Transition should be visible between the InitialState and SubmittedState
+7) Click on Save Changes button
+8) Verify the success message should be displayed - "Workflow saved successfully"
+9) Click on 'Cancel' button and verify if the newly created "Workflow" is visible in the list of Workflow table
+10) Click on the workflow and click on 'Transition' which has been created
+11) On the right side verify the Initial_State and Submitted_State along with the Transition Name
+"""
+    steps = parse_structured_task_steps(task, max_steps=40)
+
+    assert steps[0] == {"type": "click", "selector": "{{selector.transition_button}}"}
+    assert steps[1] == {"type": "click", "selector": "{{selector.from_status_dropdown}}"}
+    assert steps[2] == {
+        "type": "click",
+        "selector": "div[role='listbox'] [role='option']:has-text(\"InitialState_{{NOW_YYYYMMDD_HHMMSS}}\")",
+    }
+    assert steps[3] == {"type": "click", "selector": "{{selector.to_status_dropdown}}"}
+    assert steps[4] == {
+        "type": "click",
+        "selector": "div[role='listbox'] [role='option']:has-text(\"SubmittedState_{{NOW_YYYYMMDD_HHMMSS}}\")",
+    }
+    assert steps[5] == {
+        "type": "type",
+        "selector": "{{selector.transition_name}}",
+        "text": "Tranisition_{{NOW_YYYYMMDD_HHMMSS}}",
+        "clear_first": True,
+    }
+    assert steps[6] == {"type": "click", "selector": "{{selector.save_transition}}"}
+    assert steps[7] == {
+        "type": "wait",
+        "until": "selector_visible",
+        "selector": "text=InitialState_{{NOW_YYYYMMDD_HHMMSS}}",
+        "ms": 6000,
+    }
+    assert steps[8] == {
+        "type": "wait",
+        "until": "selector_visible",
+        "selector": "text=SubmittedState_{{NOW_YYYYMMDD_HHMMSS}}",
+        "ms": 6000,
+    }
+    assert steps[9] == {
+        "type": "wait",
+        "until": "selector_visible",
+        "selector": "text=Tranisition_{{NOW_YYYYMMDD_HHMMSS}}",
+        "ms": 6000,
+    }
+    assert steps[10] == {"type": "click", "selector": "{{selector.save_changes_button}}"}
+    assert steps[11] == {
+        "type": "wait",
+        "until": "selector_visible",
+        "selector": "{{selector.workflow_saved_success}}",
+        "ms": 6000,
+    }
+    assert steps[12] == {"type": "click", "selector": "{{selector.cancel_button}}"}
+    assert steps[13] == {
+        "type": "wait",
+        "until": "selector_visible",
+        "selector": "text=QA_Auto_Workflow_{{NOW_YYYYMMDD_HHMMSS}}",
+        "ms": 6000,
+    }
+    assert steps[14] == {
+        "type": "click",
+        "selector": "{{selector.workflow_list_item}}",
+        "text_hint": "QA_Auto_Workflow_{{NOW_YYYYMMDD_HHMMSS}}",
+    }
+    assert steps[15] == {
+        "type": "wait",
+        "until": "selector_visible",
+        "selector": "{{selector.save_changes_button}}",
+        "ms": 12000,
+    }
+    assert steps[16] == {
+        "type": "wait",
+        "until": "selector_visible",
+        "selector": "text=InitialState_{{NOW_YYYYMMDD_HHMMSS}}",
+        "ms": 15000,
+    }
+    assert steps[17] == {
+        "type": "click",
+        "selector": "{{selector.transition_canvas_label}}",
+        "text_hint": "Tranisition_{{NOW_YYYYMMDD_HHMMSS}}",
+    }
+    assert steps[18:] == [
+        {"type": "wait", "until": "selector_visible", "selector": "text=InitialState_{{NOW_YYYYMMDD_HHMMSS}}", "ms": 6000},
+        {"type": "wait", "until": "selector_visible", "selector": "text=SubmittedState_{{NOW_YYYYMMDD_HHMMSS}}", "ms": 6000},
+        {"type": "wait", "until": "selector_visible", "selector": "text=Tranisition_{{NOW_YYYYMMDD_HHMMSS}}", "ms": 6000},
+    ]
+
+
+def test_second_transition_prompt_uses_start_and_initialstate_values() -> None:
+    task = """
+1) Click on 'Transition' button
+2) Select START value from the "From status" dropdown
+3) Select InitialState<timestamp> value from the "To status" dropdown
+4) Enter Transition Name as Tranisition_<timestamp> where timestamp is the current date time stamp
+5) Click on Save button
+"""
+    steps = parse_structured_task_steps(task, max_steps=20)
+
+    assert steps[0] == {"type": "click", "selector": "{{selector.transition_button}}"}
+    assert steps[1] == {"type": "click", "selector": "{{selector.from_status_dropdown}}"}
+    assert steps[2] == {
+        "type": "click",
+        "selector": "div[role='listbox'] [role='option']:has-text(\"START\")",
+    }
+    assert steps[3] == {"type": "click", "selector": "{{selector.to_status_dropdown}}"}
+    assert steps[4] == {
+        "type": "click",
+        "selector": "div[role='listbox'] [role='option']:has-text(\"InitialState_{{NOW_YYYYMMDD_HHMMSS}}\")",
+    }

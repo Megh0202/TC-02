@@ -254,6 +254,18 @@ def test_apply_template_expands_now_macro() -> None:
     assert re.match(r"^QA_Form_\d{8}_\d{6}$", output)
 
 
+def test_initialize_runtime_test_data_stabilizes_now_templates() -> None:
+    executor = _executor()
+    data = executor._initialize_runtime_test_data({})
+
+    first = executor._apply_template("InitialState_{{NOW_YYYYMMDD_HHMMSS}}", data)
+    second = executor._apply_template("SubmittedState_{{NOW_YYYYMMDD_HHMMSS}}", data)
+
+    assert re.match(r"^InitialState_\d{8}_\d{6}$", first)
+    assert re.match(r"^SubmittedState_\d{8}_\d{6}$", second)
+    assert first.split("_", 1)[1] == second.split("_", 1)[1]
+
+
 def test_selector_memory_prioritizes_previous_successes() -> None:
     executor = _executor()
     memory = InMemorySelectorMemoryStore()
@@ -297,6 +309,56 @@ def test_selector_fallback_retries_transient_timeout_and_recovers() -> None:
 
     assert result == "Clicked #onlytarget"
     assert call_count == 2
+
+
+def test_transition_label_candidates_include_common_prompt_typo_variant() -> None:
+    executor = _executor()
+
+    candidates = executor._selector_candidates(
+        raw_selector="{{selector.transition_canvas_label}}",
+        step_type="click",
+        selector_profile={},
+        test_data={"NOW_YYYYMMDD_HHMMSS": "20260320_111947"},
+        run_domain=None,
+        text_hint="Tranisition_{{NOW_YYYYMMDD_HHMMSS}}",
+    )
+
+    assert "text=Tranisition_20260320_111947" in candidates
+    assert "text=Transition_20260320_111947" in candidates
+
+
+def test_login_click_timeout_recovers_when_create_form_appears() -> None:
+    executor = _executor(step_timeout_seconds=4)
+
+    class _Browser:
+        async def click(self, selector: str) -> str:
+            raise TimeoutError("TimeoutError()")
+
+        async def wait_for(
+            self,
+            *,
+            until: str,
+            ms: int,
+            selector: str | None = None,
+            load_state: str | None = None,
+        ) -> str:
+            if selector == "button#createForm":
+                return "visible"
+            raise TimeoutError(f"Missing {selector}")
+
+    executor._browser = _Browser()
+
+    result = asyncio.run(
+        executor._dispatch_step(
+            SimpleNamespace(test_data={}, selector_profile={}, start_url=None, steps=[]),
+            {
+                "type": "click",
+                "selector": "{{selector.login_button}}",
+            },
+        )
+    )
+
+    assert result == "Login click likely succeeded; Create Form became visible"
 
 
 def test_email_candidates_exclude_password_selectors_from_memory() -> None:
