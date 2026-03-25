@@ -15,6 +15,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8090
 
 Copy root `.env.example` to `.env` and set:
 
-- `LLM_MODE=local` for vLLM or `LLM_MODE=cloud` for OpenAI
-- `OPENAI_API_KEY` when using cloud mode
+- `LLM_MODE=local` for vLLM or `LLM_MODE=cloud` for a cloud provider
+- `CLOUD_PROVIDER=auto` to switch automatically from the configured API key, or set `openai` / `anthropic`
+- `ANTHROPIC_API_KEY` for Claude Sonnet or `OPENAI_API_KEY` for OpenAI
 - optional `BRAIN_API_KEY` for backend-to-brain auth

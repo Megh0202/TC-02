@@ -12,8 +12,11 @@ class Settings(BaseSettings):
     vllm_api_key: str = "local-key"
     vllm_model: str = "meta-llama/Llama-3.1-8B-Instruct"
 
+    cloud_provider: Literal["auto", "openai", "anthropic"] = "auto"
     openai_api_key: str = ""
     openai_model: str = "gpt-4.1-mini"
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-sonnet-4-6"
 
     brain_api_key: str = ""
 
@@ -22,6 +25,14 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @property
+    def resolved_cloud_provider(self) -> Literal["openai", "anthropic"]:
+        if self.cloud_provider != "auto":
+            return self.cloud_provider
+        if self.anthropic_api_key:
+            return "anthropic"
+        return "openai"
 
 
 @lru_cache

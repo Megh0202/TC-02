@@ -9,6 +9,7 @@ os.environ.setdefault("FILESYSTEM_MODE", "local")
 os.environ["ADMIN_API_TOKEN"] = ""
 
 from app.main import app
+from app.schemas import RunState, RunStatus, StepRuntimeState, StepSelectorHelpRequest, StepStatus
 
 
 def test_health_endpoint() -> None:
@@ -54,7 +55,7 @@ def test_run_creation_and_completion() -> None:
 def test_run_rejects_when_step_count_exceeds_limit() -> None:
     payload = {
         "run_name": "too-many-steps",
-        "steps": [{"type": "click", "selector": "button.x"}] * 21,
+        "steps": [{"type": "click", "selector": "button.x"}] * 301,
     }
 
     with TestClient(app) as client:
@@ -101,6 +102,28 @@ def test_run_accepts_test_data_and_selector_profile() -> None:
     assert body["test_data"]["email"] == "qa@example.com"
     assert body["selector_profile"]["email"] == ["#username"]
     assert body["selector_profile"]["password"] == ["#password", "input[name='password']"]
+
+
+def test_autonomous_run_accepts_prompt_without_static_steps() -> None:
+    payload = {
+        "run_name": "autonomous-run",
+        "prompt": "Open the site and figure out the next step yourself.",
+        "execution_mode": "autonomous",
+        "steps": [],
+    }
+
+    with TestClient(app) as client:
+        created = client.post("/api/runs", json=payload)
+        assert created.status_code == 200, created.text
+        run_id = created.json()["run_id"]
+
+        fetched = client.get(f"/api/runs/{run_id}")
+        assert fetched.status_code == 200, fetched.text
+
+    run = fetched.json()
+    assert run["execution_mode"] == "autonomous"
+    assert run["prompt"] == "Open the site and figure out the next step yourself."
+    assert run["status"] == "completed"
 
 
 def test_run_generates_html_report_artifact() -> None:
@@ -190,3 +213,69 @@ def test_run_artifact_endpoint_serves_report_html() -> None:
         assert report.status_code == 200, report.text
         assert "text/html" in report.headers.get("content-type", "")
         assert "Test Execution Report" in report.text
+
+
+def test_selector_help_request_normalizes_playwright_get_by_text() -> None:
+    request = StepSelectorHelpRequest.model_validate(
+        {"selector": 'page.get_by_text("Workflows", exact=True)'}
+    )
+
+    assert request.selector == ':text-is("Workflows")'
+
+
+def test_selector_help_request_normalizes_playwright_get_by_role_and_placeholder() -> None:
+    by_role = StepSelectorHelpRequest.model_validate(
+        {"selector": 'page.get_by_role("textbox", name="Enter email")'}
+    )
+    by_placeholder = StepSelectorHelpRequest.model_validate(
+        {"selector": 'page.get_by_placeholder("Enter Password")'}
+    )
+
+    assert "input[placeholder*='Enter email']" in by_role.selector
+    assert "input[aria-label*='Enter email']" in by_role.selector
+    assert by_placeholder.selector == "input[placeholder*='Enter Password'], textarea[placeholder*='Enter Password']"
+
+
+def test_selector_submit_retries_blocked_step_immediately() -> None:
+    executor = app.state.executor
+    run_store = app.state.run_store
+
+    original_dispatch = executor._dispatch_step
+    try:
+        async def _dispatch(run: RunState, raw_step: dict) -> str:
+            return f"Clicked {raw_step['selector']}"
+
+        executor._dispatch_step = _dispatch
+        run = RunState(
+            run_name="selector-submit-run",
+            status=RunStatus.waiting_for_input,
+            steps=[
+                StepRuntimeState(
+                    index=0,
+                    type="click",
+                    input={"type": "click", "selector": "button:has-text('Workflows')"},
+                    status=StepStatus.waiting_for_input,
+                    user_input_kind="selector",
+                    requested_selector_target="button:has-text('Workflows')",
+                    error="All selector candidates failed",
+                    failure_screenshot="step-000-failed.png",
+                )
+            ],
+        )
+        run_store.persist(run)
+
+        with TestClient(app) as client:
+            response = client.post(
+                f"/api/runs/{run.run_id}/steps/{run.steps[0].step_id}/selector",
+                json={"selector": "a:has-text('Workflows')"},
+            )
+
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        step = payload["steps"][0]
+        assert step["status"] == "completed"
+        assert step["message"] == "Clicked a:has-text('Workflows')"
+        assert step["failure_screenshot"] is None
+        assert payload["status"] == "completed"
+    finally:
+        executor._dispatch_step = original_dispatch

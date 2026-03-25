@@ -118,6 +118,78 @@ class LocalVLLMProvider:
 
         return self._fallback_plan(task, max_steps)
 
+    async def next_action(
+        self,
+        goal: str,
+        page: dict[str, Any],
+        history: list[dict[str, Any]],
+        remaining_steps: int,
+        memory: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        url = f"{self._settings.vllm_base_url.rstrip('/')}/chat/completions"
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a browser automation agent. "
+                        "Return ONLY strict JSON with keys: status, summary, action. "
+                        "status must be 'action' or 'complete'. "
+                        "If status='action', action must be a single supported runtime step object."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "goal": goal,
+                            "remaining_steps": remaining_steps,
+                            "memory": memory or {},
+                            "page": page,
+                            "history": history[-8:],
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            "temperature": 0.1,
+            "max_tokens": 600,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(url, json=payload, headers=self._headers())
+                response.raise_for_status()
+            data = response.json()
+            choices = data.get("choices", [])
+            if choices:
+                message = choices[0].get("message", {})
+                text = message.get("content", "")
+                if isinstance(text, str) and text.strip():
+                    parsed = self._extract_json_object(text)
+                    status = str(parsed.get("status", "")).strip().lower()
+                    if status == "complete":
+                        return {
+                            "status": "complete",
+                            "summary": str(parsed.get("summary", "")).strip(),
+                            "action": None,
+                        }
+                    if status == "action" and isinstance(parsed.get("action"), dict):
+                        return {
+                            "status": "action",
+                            "summary": str(parsed.get("summary", "")).strip(),
+                            "action": parsed["action"],
+                        }
+        except Exception:
+            pass
+
+        return {
+            "status": "complete",
+            "summary": "Local LLM could not determine the next browser action.",
+            "action": None,
+        }
+
     @staticmethod
     def _extract_json_object(text: str) -> dict[str, Any]:
         stripped = text.strip()

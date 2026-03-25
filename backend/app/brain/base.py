@@ -12,3 +12,13 @@ class BrainClient(Protocol):
 
     async def plan_task(self, task: str, max_steps: int) -> dict[str, Any]:
         ...
+
+    async def next_action(
+        self,
+        goal: str,
+        page: dict[str, Any],
+        history: list[dict[str, Any]],
+        remaining_steps: int,
+        memory: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        ...

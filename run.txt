@@ -8,9 +8,9 @@ Open 3 terminals and run each service separately.
 Update root .env with these values before starting services:
 
 LLM_MODE=cloud
-CLOUD_PROVIDER=openai
-OPENAI_API_KEY=your_openai_key_here
-OPENAI_MODEL=gpt-4.1-mini
+CLOUD_PROVIDER=auto
+ANTHROPIC_API_KEY=your_claude_key_here
+ANTHROPIC_MODEL=claude-sonnet-4-6
 BROWSER_MODE=playwright
 PLAYWRIGHT_HEADLESS=false
 PLAYWRIGHT_BROWSER=chromium
@@ -75,6 +75,7 @@ QUICK VERIFY
 3. Frontend opens at 3000.
 4. Check backend config shows:
    llm_mode=cloud
-   model=gpt-4.1-mini
+   llm_provider=anthropic
+   model=claude-sonnet-4-6
    browser_mode=playwright
 5. Run one prompt and confirm Chromium window opens and step statuses update.

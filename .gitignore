@@ -35,6 +35,10 @@ dist/
 .env.*
 !.env.example
 frontend/.env.local
+brain/.env
+backend/.env
+run.txt
+.github/run.txt
 
 # Local data/artifacts
 data/

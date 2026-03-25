@@ -4,6 +4,12 @@ from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _resolve_project_path(path: Path) -> Path:
+    return path if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+
 
 class Settings(BaseSettings):
     log_level: str = "INFO"
@@ -70,6 +76,12 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    def model_post_init(self, __context: object) -> None:
+        self.drag_debug_log_path = _resolve_project_path(self.drag_debug_log_path)
+        self.run_store_db_path = _resolve_project_path(self.run_store_db_path)
+        self.selector_memory_db_path = _resolve_project_path(self.selector_memory_db_path)
+        self.artifact_root = _resolve_project_path(self.artifact_root)
 
     @property
     def cors_origin_list(self) -> list[str]:

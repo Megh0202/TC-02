@@ -7,7 +7,14 @@ from fastapi import FastAPI, Header, HTTPException
 
 from app.config import get_settings
 from app.llm.factory import build_llm_provider
-from app.schemas import PlanRequest, PlanResponse, SummarizeRequest, SummarizeResponse
+from app.schemas import (
+    NextActionRequest,
+    NextActionResponse,
+    PlanRequest,
+    PlanResponse,
+    SummarizeRequest,
+    SummarizeResponse,
+)
 
 LOGGER = logging.getLogger("tekno.phantom.brain")
 
@@ -55,6 +62,21 @@ def build_app() -> FastAPI:
         LOGGER.debug("Plan request received with %s chars", len(request.task))
         payload = await provider.plan_task(request.task, request.max_steps)
         return PlanResponse.model_validate(payload)
+
+    @app.post("/v1/next-action", response_model=NextActionResponse)
+    async def next_action(
+        request: NextActionRequest,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> NextActionResponse:
+        ensure_auth(authorization)
+        payload = await provider.next_action(
+            request.goal,
+            request.page,
+            request.history,
+            request.remaining_steps,
+            request.memory,
+        )
+        return NextActionResponse.model_validate(payload)
 
     return app
 

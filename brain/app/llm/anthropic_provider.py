@@ -4,28 +4,28 @@ import json
 import re
 from typing import Any
 
-from openai import AsyncOpenAI
+import httpx
 
 from app.config import Settings
 
 
-class OpenAIProvider:
+class AnthropicProvider:
     mode = "cloud"
-    provider = "openai"
+    provider = "anthropic"
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self.model_name = settings.openai_model
-        self._client = AsyncOpenAI(api_key=settings.openai_api_key)
+        self.model_name = settings.anthropic_model
+        self._base_url = "https://api.anthropic.com/v1/messages"
 
     async def healthcheck(self) -> dict[str, str]:
-        if not self._settings.openai_api_key:
+        if not self._settings.anthropic_api_key:
             return {
                 "status": "degraded",
                 "mode": self.mode,
                 "provider": self.provider,
                 "model": self.model_name,
-                "detail": "OPENAI_API_KEY is not configured",
+                "detail": "ANTHROPIC_API_KEY is not configured",
             }
         return {
             "status": "ok",
@@ -35,51 +35,36 @@ class OpenAIProvider:
         }
 
     async def summarize(self, content: str) -> str:
-        if not self._settings.openai_api_key:
+        if not self._settings.anthropic_api_key:
             return f"[cloud:{self.model_name}] {content[:220]}"
 
-        completion = await self._client.responses.create(
-            model=self.model_name,
-            input=[
-                {
-                    "role": "system",
-                    "content": "Summarize this automation run in one concise sentence.",
-                },
-                {"role": "user", "content": content[:3000]},
-            ],
-            max_output_tokens=80,
+        text = await self._create_message(
+            system_prompt="Summarize this automation run in one concise sentence.",
+            user_content=content[:3000],
+            max_tokens=80,
         )
-        return completion.output_text.strip() if completion.output_text else "Run finished."
+        return text.strip() if text.strip() else "Run finished."
 
     async def plan_task(self, task: str, max_steps: int) -> dict[str, Any]:
-        if not self._settings.openai_api_key:
+        if not self._settings.anthropic_api_key:
             return self._fallback_plan(task, max_steps)
 
-        completion = await self._client.responses.create(
-            model=self.model_name,
-            input=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a web automation planner. "
-                        "Return ONLY strict JSON with keys: run_name, start_url, steps. "
-                        "steps must use types: navigate, click, type, select, drag, scroll, wait, handle_popup, verify_text, verify_image. "
-                        "Cover every explicit user instruction in order when max_steps allows. "
-                        "Do not invent extra requirements not present in the task."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Task: {task}\n"
-                        f"Max steps: {max_steps}\n"
-                        "Return compact valid JSON only."
-                    ),
-                },
-            ],
-            max_output_tokens=1400,
+        text = await self._create_message(
+            system_prompt=(
+                "You are a web automation planner. "
+                "Return ONLY strict JSON with keys: run_name, start_url, steps. "
+                "steps must use types: navigate, click, type, select, drag, scroll, wait, "
+                "handle_popup, verify_text, verify_image. "
+                "Cover every explicit user instruction in order when max_steps allows. "
+                "Do not invent extra requirements not present in the task."
+            ),
+            user_content=(
+                f"Task: {task}\n"
+                f"Max steps: {max_steps}\n"
+                "Return compact valid JSON only."
+            ),
+            max_tokens=1400,
         )
-        text = completion.output_text or ""
         if text.strip():
             try:
                 payload = self._extract_json_object(text)
@@ -96,70 +81,61 @@ class OpenAIProvider:
         remaining_steps: int,
         memory: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if not self._settings.openai_api_key:
+        if not self._settings.anthropic_api_key:
             return {
                 "status": "complete",
-                "summary": "OpenAI API key is not configured for autonomous browser reasoning.",
+                "summary": "Anthropic API key is not configured for autonomous browser reasoning.",
                 "action": None,
             }
 
         screenshot_base64 = str(page.get("screenshot_base64") or "").strip()
         screenshot_mime_type = str(page.get("screenshot_mime_type") or "image/jpeg").strip() or "image/jpeg"
-        user_content: list[dict[str, Any]] = [
+        user_blocks: list[dict[str, Any]] = []
+        user_payload = json.dumps(
             {
-                "type": "input_text",
-                "text": json.dumps(
-                    {
-                        "goal": goal,
-                        "remaining_steps": remaining_steps,
-                        "memory": memory or {},
-                        "page": {k: v for k, v in page.items() if k not in {"screenshot_base64", "screenshot_mime_type"}},
-                        "history": history[-8:],
-                    },
-                    ensure_ascii=False,
-                ),
-            }
-        ]
+                "goal": goal,
+                "remaining_steps": remaining_steps,
+                "memory": memory or {},
+                "page": {k: v for k, v in page.items() if k not in {"screenshot_base64", "screenshot_mime_type"}},
+                "history": history[-8:],
+            },
+            ensure_ascii=False,
+        )
+        user_blocks.append({"type": "text", "text": user_payload})
         if screenshot_base64:
-            user_content.append(
+            user_blocks.append(
                 {
-                    "type": "input_image",
-                    "image_url": f"data:{screenshot_mime_type};base64,{screenshot_base64}",
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": screenshot_mime_type,
+                        "data": screenshot_base64,
+                    },
                 }
             )
 
-        completion = await self._client.responses.create(
-            model=self.model_name,
-            input=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a browser automation agent. "
-                        "Return ONLY strict JSON with keys: status, summary, action. "
-                        "status must be 'action' or 'complete'. "
-                        "If status is 'action', action must contain exactly one supported runtime step using one of: "
-                        "navigate, click, type, select, drag, scroll, wait, handle_popup, verify_text, verify_image. "
-                        "Choose the single best next browser action toward the goal based on the page snapshot and recent history. "
-                        "Treat history as authoritative progress already completed. "
-                        "Continue the user's remaining instructions in order and do not repeat finished steps. "
-                        "Use memory from previous successful runs and previously proven selectors when it is relevant to the current page/domain. "
-                        "Do not stop early if explicit prompt steps remain unfinished. "
-                        "Do not invent unrelated navigation or extra checks unless needed to unblock the next explicit instruction. "
-                        "When page.interactive_elements include selectors, prefer reusing those selectors directly. "
-                        "Use the screenshot as visual evidence when DOM data is ambiguous. "
-                        "Do not ask the user for selector help unless the action is impossible to infer from the page state. "
-                        "Prefer stable Playwright selectors using id, name, label, role, data-testid, or text selectors. "
-                        "Do not return markdown or explanations outside JSON."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": user_content,
-                },
-            ],
-            max_output_tokens=800,
+        text = await self._create_message_with_blocks(
+            system_prompt=(
+                "You are a browser automation agent. "
+                "Return ONLY strict JSON with keys: status, summary, action. "
+                "status must be 'action' or 'complete'. "
+                "If status is 'action', action must contain exactly one supported runtime step using one of: "
+                "navigate, click, type, select, drag, scroll, wait, handle_popup, verify_text, verify_image. "
+                "Choose the single best next browser action toward the goal based on the page snapshot and recent history. "
+                "Treat history as authoritative progress already completed. "
+                "Continue the user's remaining instructions in order and do not repeat finished steps. "
+                "Use memory from previous successful runs and previously proven selectors when it is relevant to the current page/domain. "
+                "Do not stop early if explicit prompt steps remain unfinished. "
+                "Do not invent unrelated navigation or extra checks unless needed to unblock the next explicit instruction. "
+                "When page.interactive_elements include selectors, prefer reusing those selectors directly. "
+                "Use the screenshot as visual evidence when DOM data is ambiguous. "
+                "Do not ask the user for selector help unless the action is impossible to infer from the page state. "
+                "Prefer stable Playwright selectors using id, name, label, role, data-testid, or text selectors. "
+                "Do not return markdown or explanations outside JSON."
+            ),
+            user_blocks=user_blocks,
+            max_tokens=800,
         )
-        text = completion.output_text or ""
         if text.strip():
             try:
                 payload = self._extract_json_object(text)
@@ -184,6 +160,52 @@ class OpenAIProvider:
             "summary": "The model did not return a valid autonomous browser action.",
             "action": None,
         }
+
+    async def _create_message(self, system_prompt: str, user_content: str, max_tokens: int) -> str:
+        return await self._create_message_with_blocks(
+            system_prompt=system_prompt,
+            user_blocks=[{"type": "text", "text": user_content}],
+            max_tokens=max_tokens,
+        )
+
+    async def _create_message_with_blocks(
+        self,
+        system_prompt: str,
+        user_blocks: list[dict[str, Any]],
+        max_tokens: int,
+    ) -> str:
+        headers = {
+            "x-api-key": self._settings.anthropic_api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        payload = {
+            "model": self.model_name,
+            "max_tokens": max_tokens,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_blocks}],
+        }
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(self._base_url, headers=headers, json=payload)
+                response.raise_for_status()
+            data = response.json()
+            return self._extract_text(data)
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _extract_text(payload: dict[str, Any]) -> str:
+        content = payload.get("content")
+        if not isinstance(content, list):
+            return ""
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "".join(parts).strip()
 
     @staticmethod
     def _extract_json_object(text: str) -> dict[str, Any]:
@@ -239,10 +261,10 @@ class OpenAIProvider:
                 if len(steps) >= max_steps:
                     break
 
-        steps = OpenAIProvider._enforce_task_constraints(task, steps, max_steps)
+        steps = AnthropicProvider._enforce_task_constraints(task, steps, max_steps)
 
         if not steps:
-            return OpenAIProvider._fallback_plan(task, max_steps)
+            return AnthropicProvider._fallback_plan(task, max_steps)
 
         return {
             "run_name": run_name,

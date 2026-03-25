@@ -185,6 +185,17 @@ class BrowserMCPClient:
         await asyncio.sleep(0.05)
         return _MOCK_SCREENSHOT_BYTES
 
+    async def inspect_page(self) -> dict[str, Any]:
+        await asyncio.sleep(0.05)
+        return {
+            "url": "",
+            "title": "Mock Browser",
+            "text_excerpt": "",
+            "interactive_elements": [],
+            "screenshot_base64": "",
+            "screenshot_mime_type": "image/png",
+        }
+
 
 @dataclass
 class _PlaywrightRunContext:
@@ -301,7 +312,70 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
                         return f"Clicked {candidate}"
                 except Exception:
                     continue
-        await context.page.locator(selector).first.click()
+        locator = context.page.locator(selector).first
+        try:
+            await locator.wait_for(state="visible", timeout=2200)
+        except Exception:
+            pass
+        try:
+            await locator.scroll_into_view_if_needed(timeout=1200)
+        except Exception:
+            pass
+        try:
+            await locator.hover(timeout=900)
+        except Exception:
+            pass
+        try:
+            await locator.click(timeout=2400)
+        except Exception as click_error:
+            try:
+                await locator.click(timeout=1800, force=True)
+            except Exception:
+                try:
+                    tag_name = await locator.evaluate(
+                        """
+                        (el) => {
+                            if (!(el instanceof HTMLElement)) {
+                                throw new Error("Resolved node is not an HTMLElement");
+                            }
+                            return (el.tagName || "").toLowerCase();
+                        }
+                        """
+                    )
+                    if tag_name in {"button", "a"}:
+                        try:
+                            await locator.press("Enter", timeout=900)
+                            return f"Clicked {selector}"
+                        except Exception:
+                            try:
+                                await locator.press("Space", timeout=900)
+                                return f"Clicked {selector}"
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                try:
+                    await locator.evaluate(
+                        """
+                        (el) => {
+                            if (!(el instanceof HTMLElement)) {
+                                throw new Error("Resolved node is not an HTMLElement");
+                            }
+                            el.focus();
+                            el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+                        }
+                        """
+                    )
+                except Exception:
+                    diagnostics = await self._collect_click_diagnostics(context.page, selector)
+                    raise ValueError(
+                        f"Click failed for {selector}. "
+                        f"selector={diagnostics['selector']}; exists={diagnostics['exists']}; "
+                        f"visible={diagnostics['visible']}; enabled={diagnostics['enabled']}; "
+                        f"blocked={diagnostics['blocked']}; blocker={diagnostics['blocker']}; "
+                        f"in_iframe={diagnostics['in_iframe']}; iframe_count={diagnostics['iframe_count']}; "
+                        f"reason={self._compact_click_error(click_error)}"
+                    ) from click_error
         return f"Clicked {selector}"
 
     async def type_text(self, selector: str, text: str, clear_first: bool = True) -> str:
@@ -1051,6 +1125,136 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
             return await context.page.locator(selector).first.screenshot()
         return await context.page.screenshot(full_page=True)
 
+    async def inspect_page(self) -> dict[str, Any]:
+        context = self._active_context()
+        code = """
+() => {
+  const pick = (elements) => elements
+    .map((el) => {
+      const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+      const aria = el.getAttribute("aria-label") || "";
+      const name = el.getAttribute("name") || "";
+      const id = el.getAttribute("id") || "";
+      const testid = el.getAttribute("data-testid") || "";
+      const role = el.getAttribute("role") || "";
+      const placeholder = el.getAttribute("placeholder") || "";
+      const href = el.getAttribute("href") || "";
+      const title = el.getAttribute("title") || "";
+      const inputType = el.getAttribute("type") || "";
+      const tag = el.tagName.toLowerCase();
+      if (!(text || aria || name || id || testid || placeholder || title)) return null;
+      return {
+        tag,
+        type: inputType,
+        text: text.slice(0, 120),
+        aria,
+        name,
+        id,
+        testid,
+        role,
+        placeholder,
+        title,
+        href: href.slice(0, 120),
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 40);
+
+  const interactive = pick(Array.from(document.querySelectorAll("button, a, input, textarea, select, [role='button'], [role='link'], [role='textbox'], [data-testid]")));
+  const textExcerpt = (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 3000);
+  return {
+    url: window.location.href,
+    title: document.title || "",
+    text_excerpt: textExcerpt,
+    interactive_elements: interactive,
+  };
+}
+"""
+        payload = await context.page.evaluate(code)
+        screenshot_bytes = await context.page.screenshot(type="jpeg", quality=55)
+        payload["screenshot_base64"] = base64.b64encode(screenshot_bytes).decode("ascii")
+        payload["screenshot_mime_type"] = "image/jpeg"
+        return payload
+
+    async def _collect_click_diagnostics(self, page: Any, selector: str) -> dict[str, Any]:
+        locator = page.locator(selector).first
+        exists = False
+        visible = False
+        enabled = False
+        blocked = False
+        blocker = ""
+        iframe_count = 0
+        try:
+            iframe_count = len(page.frames)
+        except Exception:
+            iframe_count = 0
+        try:
+            exists = await page.locator(selector).count() > 0
+        except Exception:
+            exists = False
+        try:
+            visible = await locator.is_visible()
+        except Exception:
+            visible = False
+        try:
+            enabled = await locator.is_enabled()
+        except Exception:
+            enabled = False
+        try:
+            box = await locator.bounding_box()
+            if box:
+                center_x = box["x"] + (box["width"] / 2)
+                center_y = box["y"] + (box["height"] / 2)
+                probe = await page.evaluate(
+                    """
+                    ({ selector, x, y }) => {
+                      const el = document.elementFromPoint(x, y);
+                      const describe = (node) => {
+                        if (!(node instanceof Element)) return "";
+                        const tag = (node.tagName || "").toLowerCase();
+                        const id = node.id ? `#${node.id}` : "";
+                        const cls = node.className && typeof node.className === "string"
+                          ? "." + node.className.trim().split(/\s+/).slice(0, 3).join(".")
+                          : "";
+                        const text = (node.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80);
+                        return `${tag}${id}${cls}${text ? ` text="${text}"` : ""}`;
+                      };
+                      let target = null;
+                      try {
+                        target = document.querySelector(selector);
+                      } catch (e) {
+                        target = null;
+                      }
+                      const blocked = Boolean(el && target && el !== target && !target.contains(el));
+                      return {
+                        blocked,
+                        blocker: describe(el),
+                      };
+                    }
+                    """,
+                    {"selector": selector, "x": center_x, "y": center_y},
+                )
+                if isinstance(probe, dict):
+                    blocked = bool(probe.get("blocked"))
+                    blocker = str(probe.get("blocker") or "")
+        except Exception:
+            pass
+        return {
+            "selector": selector,
+            "exists": exists,
+            "visible": visible,
+            "enabled": enabled,
+            "blocked": blocked,
+            "blocker": blocker or "unknown",
+            "in_iframe": iframe_count > 1,
+            "iframe_count": iframe_count,
+        }
+
+    @staticmethod
+    def _compact_click_error(exc: Exception) -> str:
+        text = str(exc).replace("\r", " ").replace("\n", " ").strip()
+        return re.sub(r"\s+", " ", text)[:240]
+
     async def _on_dialog(self, run_id: str, dialog: Any) -> None:
         context = self._runs.get(run_id)
         if not context:
@@ -1232,12 +1436,54 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             return str(result) if result else message
         code = (
             "async (page) => {"
-            f"  await page.locator({json.dumps(selector)}).first().click();"
+            f"  const locator = page.locator({json.dumps(selector)}).first();"
+            "  try { await locator.waitFor({ state: 'visible', timeout: 2200 }); } catch (e) {}"
+            "  try { await locator.scrollIntoViewIfNeeded({ timeout: 1200 }); } catch (e) {}"
+            "  try { await locator.hover({ timeout: 900 }); } catch (e) {}"
+            "  try {"
+            "    await locator.click({ timeout: 2400 });"
+            "  } catch (e1) {"
+            "    try {"
+            "      await locator.click({ timeout: 1800, force: true });"
+            "    } catch (e2) {"
+            "      let tagName = '';"
+            "      try {"
+            "        tagName = await locator.evaluate((el) => {"
+            "          if (!(el instanceof HTMLElement)) {"
+            "            throw new Error('Resolved node is not an HTMLElement');"
+            "          }"
+            "          return (el.tagName || '').toLowerCase();"
+            "        });"
+            "      } catch (e3) {}"
+            "      if (tagName === 'button' || tagName === 'a') {"
+            "        try { await locator.press('Enter', { timeout: 900 }); return " + json.dumps(message) + "; } catch (e4) {}"
+            "        try { await locator.press('Space', { timeout: 900 }); return " + json.dumps(message) + "; } catch (e5) {}"
+            "      }"
+            "      await locator.evaluate((el) => {"
+            "        if (!(el instanceof HTMLElement)) {"
+            "          throw new Error('Resolved node is not an HTMLElement');"
+            "        }"
+            "        el.focus();"
+            "        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));"
+            "      });"
+            "    }"
+            "  }"
             f"  return {json.dumps(message)};"
             "}"
         )
-        await self._run_code(code)
-        return message
+        try:
+            await self._run_code(code)
+            return message
+        except Exception as exc:
+            diagnostics = await self._collect_click_diagnostics_mcp(selector)
+            raise ValueError(
+                f"Click failed for {selector}. "
+                f"selector={diagnostics['selector']}; exists={diagnostics['exists']}; "
+                f"visible={diagnostics['visible']}; enabled={diagnostics['enabled']}; "
+                f"blocked={diagnostics['blocked']}; blocker={diagnostics['blocker']}; "
+                f"in_iframe={diagnostics['in_iframe']}; iframe_count={diagnostics['iframe_count']}; "
+                f"reason={self._compact_click_error(exc)}"
+            ) from exc
 
     async def type_text(self, selector: str, text: str, clear_first: bool = True) -> str:
         mode = "after clear" if clear_first else "append"
@@ -1917,6 +2163,109 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
         except Exception as exc:
             raise ValueError("Unable to decode screenshot data returned from Browser MCP") from exc
 
+    async def inspect_page(self) -> dict[str, Any]:
+        code = (
+            "async (page) => {"
+            "  const nodes = Array.from(document.querySelectorAll(\"button, a, input, textarea, select, [role='button'], [role='link'], [role='textbox'], [data-testid]\"));"
+            "  const interactive = nodes.map((el) => {"
+            "    const tag = (el.tagName || '').toLowerCase();"
+            "    const text = ((el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim()).slice(0, 120);"
+            "    const aria = el.getAttribute('aria-label') || '';"
+            "    const name = el.getAttribute('name') || '';"
+            "    const id = el.getAttribute('id') || '';"
+            "    const testid = el.getAttribute('data-testid') || '';"
+            "    const role = el.getAttribute('role') || '';"
+            "    const placeholder = el.getAttribute('placeholder') || '';"
+            "    const href = el.getAttribute('href') || '';"
+            "    const inputType = el.getAttribute('type') || '';"
+            "    return { tag, type: inputType, text, aria, name, id, testid, role, placeholder, href: href.slice(0, 120) };"
+            "  }).filter((item) => item.text || item.aria || item.name || item.id || item.testid || item.placeholder).slice(0, 40);"
+            "  return {"
+            "    url: page.url(),"
+            "    title: await page.title(),"
+            "    text_excerpt: ((document.body?.innerText || '').replace(/\\s+/g, ' ').trim()).slice(0, 3000),"
+            "    interactive_elements: interactive,"
+            "  };"
+            "}"
+        )
+        result = await self._run_code(code)
+        try:
+            payload = json.loads(result)
+        except Exception:
+            payload = {
+                "url": "",
+                "title": "",
+                "text_excerpt": str(result)[:3000],
+                "interactive_elements": [],
+            }
+        screenshot_code = (
+            "async (page) => {"
+            "  const bytes = await page.screenshot({ type: 'jpeg', quality: 55 });"
+            "  return bytes.toString('base64');"
+            "}"
+        )
+        try:
+            payload["screenshot_base64"] = await self._run_code(screenshot_code)
+            payload["screenshot_mime_type"] = "image/jpeg"
+        except Exception:
+            payload["screenshot_base64"] = ""
+            payload["screenshot_mime_type"] = "image/jpeg"
+        return payload
+
+    async def _collect_click_diagnostics_mcp(self, selector: str) -> dict[str, Any]:
+        code = (
+            "async (page) => {"
+            f"  const selector = {json.dumps(selector)};"
+            "  const locator = page.locator(selector).first();"
+            "  let exists = false, visible = false, enabled = false, blocked = false;"
+            "  let blocker = 'unknown';"
+            "  try { exists = (await page.locator(selector).count()) > 0; } catch (e) {}"
+            "  try { visible = await locator.isVisible(); } catch (e) {}"
+            "  try { enabled = await locator.isEnabled(); } catch (e) {}"
+            "  try {"
+            "    const box = await locator.boundingBox();"
+            "    if (box) {"
+            "      const cx = box.x + (box.width / 2);"
+            "      const cy = box.y + (box.height / 2);"
+            "      const probe = await page.evaluate(({ selector, x, y }) => {"
+            "        const el = document.elementFromPoint(x, y);"
+            "        const describe = (node) => {"
+            "          if (!(node instanceof Element)) return '';"
+            "          const tag = (node.tagName || '').toLowerCase();"
+            "          const id = node.id ? '#' + node.id : '';"
+            "          const cls = node.className && typeof node.className === 'string' ? '.' + node.className.trim().split(/\\s+/).slice(0,3).join('.') : '';"
+            "          const text = (node.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 80);"
+            "          return tag + id + cls + (text ? ` text=\"${text}\"` : '');"
+            "        };"
+            "        let target = null;"
+            "        try { target = document.querySelector(selector); } catch (e) { target = null; }"
+            "        return { blocked: Boolean(el && target && el !== target && !target.contains(el)), blocker: describe(el) };"
+            "      }, { selector, x: cx, y: cy });"
+            "      blocked = Boolean(probe && probe.blocked);"
+            "      blocker = String((probe && probe.blocker) || 'unknown');"
+            "    }"
+            "  } catch (e) {}"
+            "  return JSON.stringify({ selector, exists, visible, enabled, blocked, blocker, in_iframe: page.frames().length > 1, iframe_count: page.frames().length });"
+            "}"
+        )
+        try:
+            result = await self._run_code(code)
+            payload = json.loads(result)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+        return {
+            "selector": selector,
+            "exists": False,
+            "visible": False,
+            "enabled": False,
+            "blocked": False,
+            "blocker": "unknown",
+            "in_iframe": False,
+            "iframe_count": 0,
+        }
+
     def _active_context(self) -> _MCPPlaywrightRunContext:
         run_id = self._current_run_id.get()
         if not run_id:
@@ -1947,6 +2296,8 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             return parsed
         if isinstance(parsed, bool):
             return "true" if parsed else "false"
+        if isinstance(parsed, (dict, list)):
+            return json.dumps(parsed)
         return str(parsed)
 
     async def _call_tool(self, context: _MCPPlaywrightRunContext, tool_name: str, arguments: dict[str, Any]) -> Any:

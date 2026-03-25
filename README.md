@@ -26,8 +26,9 @@ copy .env.example .env
 
 Set:
 - `BRAIN_BASE_URL=http://localhost:8090`
-- `LLM_MODE=local` for vLLM or `LLM_MODE=cloud` for OpenAI (brain service)
-- `OPENAI_API_KEY` when using cloud mode
+- `LLM_MODE=local` for vLLM or `LLM_MODE=cloud` for a cloud provider
+- `CLOUD_PROVIDER=auto` to switch automatically from the configured API key, or set `openai` / `anthropic`
+- `ANTHROPIC_API_KEY` for Claude Sonnet or `OPENAI_API_KEY` for OpenAI
 
 ### 2) Brain Service
 

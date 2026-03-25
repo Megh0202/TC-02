@@ -57,6 +57,8 @@ class InMemoryRunStore:
         run = RunState(
             run_name=request.run_name,
             start_url=request.start_url,
+            prompt=request.prompt,
+            execution_mode=request.execution_mode,
             test_data=request.test_data,
             selector_profile=request.selector_profile,
             steps=steps,

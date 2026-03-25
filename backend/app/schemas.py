@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from enum import Enum
+import re
 from typing import Annotated, Any, Literal, Union
 from uuid import uuid4
 
@@ -15,6 +16,7 @@ def utc_now() -> datetime:
 class RunStatus(str, Enum):
     pending = "pending"
     running = "running"
+    waiting_for_input = "waiting_for_input"
     completed = "completed"
     failed = "failed"
     cancelled = "cancelled"
@@ -23,6 +25,7 @@ class RunStatus(str, Enum):
 class StepStatus(str, Enum):
     pending = "pending"
     running = "running"
+    waiting_for_input = "waiting_for_input"
     completed = "completed"
     failed = "failed"
     cancelled = "cancelled"
@@ -118,9 +121,16 @@ JsonScalar = str | int | float | bool | None
 class RunCreateRequest(BaseModel):
     run_name: str = "agent-run"
     start_url: str | None = None
-    steps: list[ActionStep] = Field(min_length=1)
+    prompt: str = ""
+    execution_mode: Literal["plan", "autonomous"] = "plan"
+    steps: list[ActionStep] = Field(default_factory=list)
     test_data: dict[str, JsonScalar] = Field(default_factory=dict)
     selector_profile: dict[str, list[str]] = Field(default_factory=dict)
+
+    @field_validator("prompt")
+    @classmethod
+    def normalize_prompt(cls, value: str) -> str:
+        return value.strip()
 
     @field_validator("steps")
     @classmethod
@@ -128,6 +138,18 @@ class RunCreateRequest(BaseModel):
         if len(value) > 500:
             raise ValueError("steps cannot exceed 500")
         return value
+
+    @field_validator("execution_mode")
+    @classmethod
+    def normalize_execution_mode(cls, value: str) -> str:
+        return value.strip().lower()
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.execution_mode == "autonomous":
+            if not self.prompt:
+                raise ValueError("prompt is required when execution_mode=autonomous")
+        elif not self.steps:
+            raise ValueError("steps must contain at least one action when execution_mode=plan")
 
     @field_validator("test_data", mode="before")
     @classmethod
@@ -327,12 +349,18 @@ class StepRuntimeState(BaseModel):
     message: str | None = None
     error: str | None = None
     failure_screenshot: str | None = None
+    user_input_kind: str | None = None
+    user_input_prompt: str | None = None
+    requested_selector_target: str | None = None
+    provided_selector: str | None = None
 
 
 class RunState(BaseModel):
     run_id: str = Field(default_factory=lambda: str(uuid4()))
     run_name: str
     start_url: str | None = None
+    prompt: str = ""
+    execution_mode: Literal["plan", "autonomous"] = "plan"
     test_data: dict[str, JsonScalar] = Field(default_factory=dict)
     selector_profile: dict[str, list[str]] = Field(default_factory=dict)
     status: RunStatus = RunStatus.pending
@@ -351,3 +379,77 @@ class RunListResponse(BaseModel):
 class CancelRunResponse(BaseModel):
     run_id: str
     status: RunStatus
+
+
+class StepSelectorHelpRequest(BaseModel):
+    selector: str = Field(min_length=1, max_length=1000)
+
+    @field_validator("selector")
+    @classmethod
+    def normalize_selector(cls, value: str) -> str:
+        normalized = value.strip()
+        locator_match = re.search(
+            r"(?:await\s+)?page\.locator\(\s*([\"'])(.*?)\1\s*\)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if locator_match:
+            normalized = locator_match.group(2).strip()
+        get_by_text_match = re.search(
+            r"(?:await\s+)?page\.get_by_text\(\s*([\"'])(.*?)\1(?:\s*,\s*exact\s*=\s*(True|False|true|false))?\s*\)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if get_by_text_match:
+            text_value = get_by_text_match.group(2).strip()
+            exact_flag = (get_by_text_match.group(3) or "").lower()
+            if exact_flag == "true":
+                escaped = text_value.replace("\\", "\\\\").replace('"', '\\"')
+                normalized = f':text-is("{escaped}")'
+            else:
+                normalized = f"text={text_value}"
+        get_by_placeholder_match = re.search(
+            r"(?:await\s+)?page\.get_by_placeholder\(\s*([\"'])(.*?)\1\s*\)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if get_by_placeholder_match:
+            placeholder_value = get_by_placeholder_match.group(2).strip().replace("'", "\\'")
+            normalized = f"input[placeholder*='{placeholder_value}'], textarea[placeholder*='{placeholder_value}']"
+        get_by_label_match = re.search(
+            r"(?:await\s+)?page\.get_by_label\(\s*([\"'])(.*?)\1\s*\)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if get_by_label_match:
+            label_value = get_by_label_match.group(2).strip().replace("'", "\\'")
+            normalized = (
+                f"input[aria-label*='{label_value}'], textarea[aria-label*='{label_value}'], "
+                f"select[aria-label*='{label_value}'], label:has-text('{label_value}') input"
+            )
+        get_by_role_match = re.search(
+            r"(?:await\s+)?page\.get_by_role\(\s*([\"'])(.*?)\1(?:\s*,\s*name\s*=\s*([\"'])(.*?)\3)?\s*\)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if get_by_role_match:
+            role_value = get_by_role_match.group(2).strip().lower()
+            name_value = (get_by_role_match.group(4) or "").strip().replace("'", "\\'")
+            if role_value == "textbox":
+                if name_value:
+                    normalized = (
+                        f"input[placeholder*='{name_value}'], textarea[placeholder*='{name_value}'], "
+                        f"input[aria-label*='{name_value}'], textarea[aria-label*='{name_value}'], "
+                        f"label:has-text('{name_value}') input"
+                    )
+                else:
+                    normalized = "input, textarea, [role='textbox']"
+            elif name_value:
+                normalized = f"[role='{role_value}']:has-text('{name_value}')"
+            else:
+                normalized = f"[role='{role_value}']"
+        if normalized.startswith("//") or normalized.startswith("(//"):
+            normalized = f"xpath={normalized}"
+        if not normalized:
+            raise ValueError("selector cannot be blank")
+        return normalized

@@ -30,6 +30,7 @@ from app.schemas import (
     RunListResponse,
     RunState,
     StepImportResponse,
+    StepSelectorHelpRequest,
     TestCaseCreateRequest,
     TestCaseListResponse,
     TestCaseState,
@@ -252,6 +253,8 @@ def build_app() -> FastAPI:
         file_client,
         selector_memory_store=selector_memory,
     )
+    app.state.executor = executor
+    app.state.run_store = run_store
     require_admin_auth = build_admin_auth_dependency(settings)
 
     @app.on_event("shutdown")
@@ -276,10 +279,13 @@ def build_app() -> FastAPI:
         health = await brain_client.healthcheck()
         return {
             "llm_mode": health.get("mode", "unknown"),
+            "llm_provider": health.get("provider", "unknown"),
             "model": health.get("model", "unknown"),
             "browser_mode": settings.browser_mode,
             "filesystem_mode": settings.filesystem_mode,
             "run_store_backend": settings.run_store_backend,
+            "run_store_db_path": str(settings.run_store_db_path),
+            "artifact_root": str(settings.artifact_root),
             "max_steps_per_run": settings.max_steps_per_run,
             "admin_auth_required": bool(settings.admin_api_token),
         }
@@ -291,23 +297,43 @@ def build_app() -> FastAPI:
         _: None = Depends(require_admin_auth),
     ) -> RunState:
         raw_steps = [step.model_dump(exclude_none=True) for step in request.steps]
-        expanded_steps = _expand_drag_steps(
-            raw_steps,
-            max_steps=settings.max_steps_per_run,
-            auto_drag_pre_click_enabled=settings.auto_drag_pre_click_enabled,
-            auto_drag_post_wait_ms=settings.auto_drag_post_wait_ms,
-        )
-        expanded_request = RunCreateRequest.model_validate(
-            {
-                "run_name": request.run_name,
-                "start_url": request.start_url,
-                "steps": expanded_steps,
-                "test_data": request.test_data,
-                "selector_profile": request.selector_profile,
-            }
-        )
+        if request.execution_mode == "plan" and len(raw_steps) > settings.max_steps_per_run:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Step count exceeds max_steps_per_run={settings.max_steps_per_run}",
+            )
+        if request.execution_mode == "autonomous":
+            expanded_request = RunCreateRequest.model_validate(
+                {
+                    "run_name": request.run_name,
+                    "start_url": request.start_url,
+                    "prompt": request.prompt,
+                    "execution_mode": request.execution_mode,
+                    "steps": raw_steps,
+                    "test_data": request.test_data,
+                    "selector_profile": request.selector_profile,
+                }
+            )
+        else:
+            expanded_steps = _expand_drag_steps(
+                raw_steps,
+                max_steps=settings.max_steps_per_run,
+                auto_drag_pre_click_enabled=settings.auto_drag_pre_click_enabled,
+                auto_drag_post_wait_ms=settings.auto_drag_post_wait_ms,
+            )
+            expanded_request = RunCreateRequest.model_validate(
+                {
+                    "run_name": request.run_name,
+                    "start_url": request.start_url,
+                    "prompt": request.prompt,
+                    "execution_mode": request.execution_mode,
+                    "steps": expanded_steps,
+                    "test_data": request.test_data,
+                    "selector_profile": request.selector_profile,
+                }
+            )
 
-        if len(expanded_request.steps) > settings.max_steps_per_run:
+        if expanded_request.execution_mode == "plan" and len(expanded_request.steps) > settings.max_steps_per_run:
             raise HTTPException(
                 status_code=400,
                 detail=f"Step count exceeds max_steps_per_run={settings.max_steps_per_run}",
@@ -605,6 +631,25 @@ def build_app() -> FastAPI:
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         return CancelRunResponse(run_id=run_id, status=run.status)
+
+    @app.post("/api/runs/{run_id}/steps/{step_id}/selector", response_model=RunState)
+    async def provide_step_selector(
+        run_id: str,
+        step_id: str,
+        request: StepSelectorHelpRequest,
+        _: None = Depends(require_admin_auth),
+    ) -> RunState:
+        try:
+            run = executor.apply_manual_selector_hint(run_id, step_id, request.selector)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not run:
+            raise HTTPException(status_code=404, detail="Run or step not found")
+        await executor.execute(run_id)
+        resumed = run_store.get(run_id)
+        if not resumed:
+            raise HTTPException(status_code=404, detail="Run not found after resume")
+        return resumed
 
     return app
 

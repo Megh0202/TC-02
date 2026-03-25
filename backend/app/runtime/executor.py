@@ -14,6 +14,7 @@ from app.brain.base import BrainClient
 from app.config import Settings
 from app.mcp.browser_client import BrowserMCPClient
 from app.mcp.filesystem_client import FileSystemClient
+from app.runtime.plan_normalizer import normalize_plan_steps
 from app.runtime.selector_memory import SelectorMemoryStore
 from app.runtime.store import RunStore
 from app.schemas import RunState, RunStatus, StepRuntimeState, StepStatus
@@ -21,22 +22,71 @@ from app.schemas import RunState, RunStatus, StepRuntimeState, StepStatus
 LOGGER = logging.getLogger("tekno.phantom.executor")
 TEMPLATE_PATTERN = re.compile(r"\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}")
 DEFAULT_SELECTOR_PROFILE: dict[str, list[str]] = {
+    "popup_accept": [
+        "button:has-text('Accept')",
+        "button:has-text('Accept all')",
+        "button:has-text('I agree')",
+        "button:has-text('Agree')",
+        "button:has-text('Allow all')",
+        "button:has-text('Allow')",
+        "button:has-text('Continue')",
+        "button:has-text('OK')",
+        "button:has-text('Got it')",
+        "button:has-text('Alle akzeptieren')",
+        "button:has-text('Akzeptieren')",
+        "button:has-text('Zustimmen')",
+        "[role='button']:has-text('Accept')",
+        "[role='button']:has-text('Accept all')",
+        "[role='button']:has-text('Alle akzeptieren')",
+        "[role='button']:has-text('Akzeptieren')",
+        "[id*='accept']",
+        "[data-testid*='accept']",
+        "[aria-label*='accept']",
+        "[aria-label*='cookie']",
+    ],
+    "popup_dismiss": [
+        "button[aria-label*='Close']",
+        "button[aria-label*='Dismiss']",
+        "button[aria-label*='Schlie']",
+        "button:has-text('Close')",
+        "button:has-text('Dismiss')",
+        "button:has-text('Skip')",
+        "button:has-text('Not now')",
+        "button:has-text('Later')",
+        "button:has-text('Schlie')",
+        "[role='button']:has-text('Close')",
+        "[role='button']:has-text('Dismiss')",
+        "[data-testid*='close']",
+        "[aria-label*='close']",
+    ],
     "email": [
         "#username",
         "input[name='username']",
+        "input[name='email']",
+        "input[id='email']",
         "input[type='email']",
         "input[autocomplete='email']",
+        "input[autocomplete='username']",
+        "input[placeholder*='Email']",
+        "input[placeholder*='email']",
         "input[type='text']",
     ],
     "username": [
         "#username",
         "input[name='username']",
+        "input[name='email']",
+        "input[id='email']",
+        "input[placeholder*='Email']",
+        "input[placeholder*='email']",
         "input[type='text']",
     ],
     "password": [
         "#password",
         "input[name='password']",
+        "input[id='password']",
         "input[type='password']",
+        "input[placeholder*='Password']",
+        "input[placeholder*='password']",
     ],
     "login_button": [
         "button[name='login']",
@@ -50,6 +100,28 @@ DEFAULT_SELECTOR_PROFILE: dict[str, list[str]] = {
         "text=Sign In",
         "text=Log In",
         "text=Login",
+    ],
+    "language_switcher": [
+        "button[aria-label*='language']",
+        "[role='button'][aria-label*='language']",
+        "button[title*='language']",
+        "[title*='language']",
+        "[aria-haspopup='listbox']",
+        "[role='combobox']",
+        "select[name*='lang']",
+        "select[name*='locale']",
+        "[name*='lang']",
+        "[id*='lang']",
+        "[data-testid*='lang']",
+        "[data-testid*='locale']",
+        "button:has-text('DE')",
+        "button:has-text('EN')",
+        "button:has-text('FR')",
+        "button:has-text('ES')",
+        "text=DE",
+        "text=EN",
+        "text=FR",
+        "text=ES",
     ],
     "create_form": [
         "button#createForm",
@@ -450,52 +522,251 @@ class AgentExecutor:
         if not run:
             return
 
+        is_new_run = run.started_at is None
         run.test_data = self._initialize_runtime_test_data(run.test_data or {})
         run.status = RunStatus.running
-        run.started_at = utc_now()
+        if is_new_run:
+            run.started_at = utc_now()
         self._run_store.persist(run)
+        preserve_browser_session = False
 
         try:
             await self._browser.start_run(run_id)
 
-            if run.start_url:
+            if is_new_run and run.start_url:
                 await asyncio.wait_for(
                     self._browser.navigate(run.start_url),
                     timeout=self._settings.step_timeout_seconds,
                 )
 
             has_step_failure = False
-            for step in run.steps:
-                if self._run_store.is_cancelled(run_id):
-                    step.status = StepStatus.cancelled
-                    run.status = RunStatus.cancelled
-                    self._run_store.persist(run)
-                    break
+            if run.execution_mode == "autonomous" and run.prompt:
+                has_step_failure = await self._execute_existing_steps(run)
+                if run.status == RunStatus.running and not has_step_failure:
+                    generated_failure = await self._execute_autonomous_run(run)
+                    has_step_failure = has_step_failure or generated_failure
+                if run.status == RunStatus.waiting_for_input:
+                    preserve_browser_session = True
+            else:
+                has_step_failure = await self._execute_existing_steps(run)
 
-                await self._execute_step(run, step)
-                self._run_store.persist(run)
-                if step.status == StepStatus.failed:
-                    has_step_failure = True
+            if run.status == RunStatus.waiting_for_input:
+                preserve_browser_session = True
 
             if run.status == RunStatus.running:
                 run.status = RunStatus.failed if has_step_failure else RunStatus.completed
                 self._run_store.persist(run)
 
-            summary_text = self._build_summary(run)
-            run.summary = await self._brain.summarize(summary_text)
-            await self._files.write_text_artifact(run_id, "summary.txt", run.summary)
-            self._run_store.persist(run)
+            if run.status != RunStatus.waiting_for_input:
+                summary_text = self._build_summary(run)
+                run.summary = await self._brain.summarize(summary_text)
+                await self._files.write_text_artifact(run_id, "summary.txt", run.summary)
+                self._run_store.persist(run)
         except Exception as exc:
             run.status = RunStatus.failed
             run.summary = f"Run failed unexpectedly ({type(exc).__name__}): {exc!r}"
             self._run_store.persist(run)
             LOGGER.exception("Run %s failed unexpectedly", run_id)
         finally:
-            await self._browser.close_run(run_id)
-            run.finished_at = utc_now()
+            if not preserve_browser_session:
+                await self._browser.close_run(run_id)
+                run.finished_at = utc_now()
             self._run_store.persist(run)
-            await self._write_html_report(run)
+            if not preserve_browser_session:
+                await self._write_html_report(run)
             self._run_store.clear_cancel(run_id)
+
+    async def _execute_existing_steps(self, run: RunState) -> bool:
+        has_step_failure = False
+        for step in run.steps:
+            if step.status == StepStatus.completed:
+                continue
+            if step.status == StepStatus.waiting_for_input:
+                run.status = RunStatus.waiting_for_input
+                self._run_store.persist(run)
+                break
+            if self._run_store.is_cancelled(run.run_id):
+                step.status = StepStatus.cancelled
+                run.status = RunStatus.cancelled
+                self._run_store.persist(run)
+                break
+
+            await self._execute_step(run, step)
+            self._run_store.persist(run)
+            if step.status == StepStatus.waiting_for_input:
+                run.status = RunStatus.waiting_for_input
+                self._run_store.persist(run)
+                break
+            if step.status == StepStatus.failed:
+                has_step_failure = True
+                break
+        return has_step_failure
+
+    async def _execute_autonomous_run(self, run: RunState) -> bool:
+        max_steps = max(int(self._settings.max_steps_per_run), 1)
+        history: list[dict[str, Any]] = self._history_from_run(run)
+        has_step_failure = False
+
+        while len(run.steps) < max_steps:
+            if self._run_store.is_cancelled(run.run_id):
+                run.status = RunStatus.cancelled
+                self._run_store.persist(run)
+                break
+
+            await self._auto_handle_known_popups(run)
+            page_snapshot = await self._browser.inspect_page()
+            memory_context = self._build_autonomous_memory(run)
+            remaining_steps = max_steps - len(run.steps)
+            decision = await self._brain.next_action(
+                goal=run.prompt,
+                page=page_snapshot,
+                history=history,
+                remaining_steps=remaining_steps,
+                memory=memory_context,
+            )
+
+            decision_status = str(decision.get("status", "")).strip().lower()
+            if decision_status == "complete":
+                summary = str(decision.get("summary", "")).strip()
+                if summary:
+                    run.summary = summary
+                break
+
+            raw_action = decision.get("action")
+            normalized_steps = normalize_plan_steps(
+                [raw_action],
+                max_steps=1,
+                default_wait_ms=self._settings.planner_default_wait_ms,
+            )
+            if not normalized_steps:
+                has_step_failure = True
+                run.summary = "Autonomous mode stopped because the brain returned an invalid action."
+                break
+
+            step_input = normalized_steps[0]
+            step = StepRuntimeState(
+                index=len(run.steps),
+                type=str(step_input.get("type", "step")),
+                input=step_input,
+                status=StepStatus.pending,
+            )
+            run.steps.append(step)
+            self._run_store.persist(run)
+
+            await self._execute_step(run, step)
+            self._run_store.persist(run)
+            history.append(
+                {
+                    "step_index": step.index,
+                    "type": step.type,
+                    "input": step.input,
+                    "status": step.status.value,
+                    "message": step.message,
+                    "error": step.error,
+                }
+            )
+            if step.status == StepStatus.waiting_for_input:
+                run.status = RunStatus.waiting_for_input
+                self._run_store.persist(run)
+                break
+            if step.status == StepStatus.failed:
+                has_step_failure = True
+                break
+
+        if len(run.steps) >= max_steps and run.status == RunStatus.running:
+            has_step_failure = True
+            run.summary = "Autonomous mode reached the maximum step budget before completing the goal."
+
+        return has_step_failure
+
+    @staticmethod
+    def _history_from_run(run: RunState) -> list[dict[str, Any]]:
+        history: list[dict[str, Any]] = []
+        for step in run.steps[-20:]:
+            history.append(
+                {
+                    "step_index": step.index,
+                    "type": step.type,
+                    "input": step.input,
+                    "status": step.status.value,
+                    "message": step.message,
+                    "error": step.error,
+                }
+            )
+        return history
+
+    def _build_autonomous_memory(self, run: RunState) -> dict[str, Any]:
+        run_domain = self._extract_run_domain(run)
+        completed_steps = [
+            self._step_memory_summary(step)
+            for step in run.steps
+            if step.status == StepStatus.completed
+        ]
+        previous_successes: list[dict[str, Any]] = []
+        for previous in self._run_store.list():
+            if previous.run_id == run.run_id:
+                continue
+            if previous.status != RunStatus.completed:
+                continue
+            if run_domain and self._extract_run_domain(previous) != run_domain:
+                continue
+            previous_summary = {
+                "run_id": previous.run_id,
+                "run_name": previous.run_name,
+                "prompt": (previous.prompt or "")[:300],
+                "summary": (previous.summary or "")[:300],
+                "steps": [
+                    item
+                    for item in (
+                        self._step_memory_summary(step)
+                        for step in previous.steps
+                        if step.status == StepStatus.completed
+                    )
+                    if item
+                ][:8],
+            }
+            if previous_summary["steps"] or previous_summary["summary"] or previous_summary["prompt"]:
+                previous_successes.append(previous_summary)
+            if len(previous_successes) >= 3:
+                break
+
+        memory: dict[str, Any] = {
+            "domain": run_domain or "",
+            "current_run_completed_steps": [item for item in completed_steps if item][-8:],
+            "previous_successful_runs": previous_successes,
+        }
+        if run.selector_profile:
+            memory["selector_profile_keys"] = sorted(run.selector_profile.keys())[:20]
+        return memory
+
+    @staticmethod
+    def _step_memory_summary(step: StepRuntimeState) -> dict[str, Any] | None:
+        payload: dict[str, Any] = {
+            "type": step.type,
+        }
+        raw_selector = step.input.get("selector")
+        if isinstance(raw_selector, str) and raw_selector.strip():
+            payload["selector"] = raw_selector.strip()
+        if step.provided_selector:
+            payload["resolved_selector"] = step.provided_selector.strip()
+        if step.message:
+            payload["message"] = step.message[:180]
+        if step.type == "type":
+            text_value = step.input.get("text")
+            if isinstance(text_value, str) and text_value.strip():
+                payload["text_hint"] = text_value.strip()[:80]
+        if step.type == "select":
+            value = step.input.get("value")
+            if isinstance(value, str) and value.strip():
+                payload["value"] = value.strip()[:80]
+        if step.type == "drag":
+            source_selector = step.input.get("source_selector")
+            target_selector = step.input.get("target_selector")
+            if isinstance(source_selector, str) and source_selector.strip():
+                payload["source_selector"] = source_selector.strip()
+            if isinstance(target_selector, str) and target_selector.strip():
+                payload["target_selector"] = target_selector.strip()
+        return payload if len(payload) > 1 else None
 
     async def _write_html_report(self, run: RunState) -> None:
         try:
@@ -512,30 +783,176 @@ class AgentExecutor:
         step.error = None
         step.message = None
         step.failure_screenshot = None
+        step.user_input_kind = None
+        step.user_input_prompt = None
+        step.requested_selector_target = None
 
         try:
+            if step.type != "handle_popup":
+                await self._auto_handle_known_popups(run)
             message = await asyncio.wait_for(
                 self._dispatch_step(run, step.input),
                 timeout=self._settings.step_timeout_seconds,
             )
             step.status = StepStatus.completed
             step.message = message
+            original_selector_request = step.input.get("_selector_help_original")
+            if (
+                isinstance(original_selector_request, str)
+                and original_selector_request.strip()
+                and step.provided_selector
+            ):
+                self._remember_selector_success(
+                    run_domain=self._extract_run_domain(run),
+                    step_type=step.type,
+                    raw_selector=original_selector_request.strip(),
+                    resolved_selector=step.provided_selector,
+                    text_hint=None,
+                )
             await self._files.write_text_artifact(
                 run.run_id,
                 f"step-{step.index:03d}.log",
                 f"{step.type}: {message}",
             )
         except Exception as exc:
-            step.status = StepStatus.failed
             compact = self._compact_error(exc)
-            if isinstance(exc, TimeoutError):
-                step.error = f"{compact} (step_type={step.type})"
-            else:
+            if self._should_request_selector_help(step, exc):
+                step.status = StepStatus.waiting_for_input
                 step.error = compact
-            step.message = "Step failed"
-            await self._capture_failure_screenshot(run.run_id, step)
+                step.message = "Waiting for selector help"
+                step.user_input_kind = "selector"
+                step.requested_selector_target = self._requested_selector_target(step)
+                step.user_input_prompt = self._build_selector_help_prompt(step)
+            else:
+                step.status = StepStatus.failed
+                if isinstance(exc, TimeoutError):
+                    step.error = f"{compact} (step_type={step.type})"
+                else:
+                    step.error = compact
+                step.message = "Step failed"
+                await self._capture_failure_screenshot(run.run_id, step)
         finally:
             step.ended_at = utc_now()
+
+    async def _auto_handle_known_popups(self, run: RunState) -> None:
+        try:
+            snapshot = await self._browser.inspect_page()
+        except Exception:
+            return
+        if not self._looks_like_popup_blocker(snapshot):
+            return
+
+        run_domain = self._extract_run_domain(run)
+        popup_plans = (
+            ("popup_accept", "accept"),
+            ("popup_dismiss", "dismiss"),
+        )
+        for profile_key, policy in popup_plans:
+            selectors = self._merge_profile_candidates(profile_key, run.selector_profile or {})
+            for selector in selectors:
+                try:
+                    result = await asyncio.wait_for(
+                        self._browser.handle_popup(policy=policy, selector=selector),
+                        timeout=2.5,
+                    )
+                except Exception:
+                    continue
+                result_lower = result.lower()
+                if "handled" not in result_lower and "clicked" not in result_lower:
+                    continue
+                self._remember_selector_success(
+                    run_domain=run_domain,
+                    step_type="handle_popup",
+                    raw_selector=profile_key,
+                    resolved_selector=selector,
+                    text_hint=policy,
+                )
+                return
+
+    @staticmethod
+    def _looks_like_popup_blocker(snapshot: dict[str, Any]) -> bool:
+        text_excerpt = str(snapshot.get("text_excerpt", "")).lower()
+        interactive_elements = snapshot.get("interactive_elements")
+        popup_signals = (
+            "cookie",
+            "cookies",
+            "consent",
+            "privacy",
+            "gdpr",
+            "we use cookies",
+            "accept all",
+            "allow all",
+            "alle akzeptieren",
+            "akzeptieren",
+            "zustimmen",
+        )
+        if any(token in text_excerpt for token in popup_signals):
+            return True
+        if isinstance(interactive_elements, list):
+            for item in interactive_elements[:20]:
+                if not isinstance(item, dict):
+                    continue
+                haystack = " ".join(
+                    str(item.get(field, "")).lower()
+                    for field in ("text", "aria", "name", "id", "testid", "role", "title")
+                )
+                if any(token in haystack for token in popup_signals):
+                    return True
+        return False
+
+    def apply_manual_selector_hint(self, run_id: str, step_id: str, selector: str) -> RunState | None:
+        run = self._run_store.get(run_id)
+        if not run:
+            return None
+
+        step = next((item for item in run.steps if item.step_id == step_id), None)
+        if not step:
+            return None
+        if not self._can_accept_manual_selector_hint(step):
+            raise ValueError("This step is not eligible for selector input recovery.")
+
+        requested_selector = self._requested_selector_target(step)
+        if not requested_selector:
+            raise ValueError("This step does not support selector input recovery.")
+        if step.type == "click":
+            lowered = selector.strip().lower()
+            if lowered == "html" or lowered.startswith("html."):
+                raise ValueError(
+                    "That selector points to the page root, not the clickable target. "
+                    "Please provide the actual button, link, or menu item selector."
+                )
+
+        step.input["selector"] = selector
+        step.input["_selector_help_original"] = requested_selector
+        step.provided_selector = selector
+        step.status = StepStatus.pending
+        step.started_at = None
+        step.ended_at = None
+        step.error = None
+        step.message = "Retrying this step with the selector you provided."
+        step.failure_screenshot = None
+        step.user_input_kind = None
+        step.user_input_prompt = None
+        step.requested_selector_target = None
+
+        run.status = RunStatus.running
+        run.finished_at = None
+        self._run_store.persist(run)
+        return run
+
+    @classmethod
+    def _can_accept_manual_selector_hint(cls, step: StepRuntimeState) -> bool:
+        if step.status == StepStatus.waiting_for_input:
+            return step.user_input_kind == "selector"
+        if step.status != StepStatus.failed:
+            return False
+        if step.type not in {"click", "type", "select", "wait", "handle_popup", "verify_text"}:
+            return False
+        error_text = str(step.error or step.message or "").strip()
+        if not error_text:
+            return False
+        probe = RuntimeError(error_text)
+        return cls._should_request_selector_help(step, probe)
 
     async def _capture_failure_screenshot(self, run_id: str, step: StepRuntimeState) -> None:
         try:
@@ -565,8 +982,45 @@ class AgentExecutor:
             selector = str(raw_step["selector"])
             alias_key = self._selector_alias_key(selector)
             text_hint = raw_step.get("text_hint")
+            if alias_key == "transition_canvas_label":
+                try:
+                    await self._run_with_selector_fallback(
+                        "{{selector.save_changes_button}}",
+                        "wait",
+                        selector_profile,
+                        test_data,
+                        run_domain,
+                        lambda resolved: self._browser.wait_for(
+                            until="selector_visible",
+                            ms=1500,
+                            selector=resolved,
+                            load_state=None,
+                        ),
+                    )
+                    return "Transition canvas click treated as non-blocking"
+                except Exception:
+                    if text_hint is not None:
+                        for label_selector in self._transition_label_signal_selectors(str(text_hint), test_data):
+                            try:
+                                await self._run_with_selector_fallback(
+                                    label_selector,
+                                    "wait",
+                                    selector_profile,
+                                    test_data,
+                                    run_domain,
+                                    lambda resolved: self._browser.wait_for(
+                                        until="selector_visible",
+                                        ms=1500,
+                                        selector=resolved,
+                                        load_state=None,
+                                    ),
+                                )
+                                return "Transition label is visible on canvas"
+                            except Exception:
+                                continue
+                    return "Transition canvas click treated as non-blocking"
             try:
-                return await self._run_with_selector_fallback(
+                click_operation = self._run_with_selector_fallback(
                     selector,
                     step_type,
                     selector_profile,
@@ -575,8 +1029,32 @@ class AgentExecutor:
                     lambda resolved: self._browser.click(resolved),
                     text_hint=str(text_hint) if text_hint is not None else None,
                 )
+                if alias_key in {"login_button", "transition_canvas_label"}:
+                    click_budget_s = max(
+                        3.0,
+                        min(float(self._settings.step_timeout_seconds) * 0.2, 12.0),
+                    )
+                    return await asyncio.wait_for(click_operation, timeout=click_budget_s)
+                return await click_operation
             except Exception as exc:
                 if alias_key == "login_button":
+                    try:
+                        await self._run_with_selector_fallback(
+                            "{{selector.create_form}}",
+                            "wait",
+                            selector_profile,
+                            test_data,
+                            run_domain,
+                            lambda resolved: self._browser.wait_for(
+                                until="selector_visible",
+                                ms=20000,
+                                selector=resolved,
+                                load_state=None,
+                            ),
+                        )
+                        return "Login click likely succeeded; Create Form became visible"
+                    except Exception:
+                        pass
                     for success_selector, success_message in (
                         ("{{selector.create_form}}", "Login click likely succeeded; Create Form became visible"),
                         ("{{selector.top_left_corner}}", "Login click likely succeeded; application shell became visible"),
@@ -853,7 +1331,7 @@ class AgentExecutor:
             text_hint,
         )
         last_error: Exception | None = None
-        candidate_timeout_s = self._candidate_timeout_seconds(len(candidates))
+        candidate_timeout_s = self._candidate_timeout_seconds(len(candidates), step_type=step_type)
         attempts: list[str] = []
         recovery_attempts = self._selector_recovery_attempts()
 
@@ -879,6 +1357,28 @@ class AgentExecutor:
                 break
             await self._selector_recovery_pause()
 
+        live_candidates = await self._live_page_selector_candidates(
+            raw_selector=raw_selector,
+            step_type=step_type,
+            text_hint=text_hint,
+        )
+        live_candidates = [candidate for candidate in live_candidates if candidate not in candidates]
+        if live_candidates:
+            for selector in live_candidates:
+                try:
+                    result = await asyncio.wait_for(operation(selector), timeout=candidate_timeout_s)
+                    self._remember_selector_success(
+                        run_domain=run_domain,
+                        step_type=step_type,
+                        raw_selector=raw_selector,
+                        resolved_selector=selector,
+                        text_hint=text_hint,
+                    )
+                    return result
+                except Exception as exc:
+                    last_error = exc
+                    attempts.append(f"live: {selector} -> {self._compact_error(exc)}")
+
         if last_error:
             if attempts:
                 attempted = "; ".join(attempts)
@@ -886,12 +1386,182 @@ class AgentExecutor:
             raise last_error
         raise ValueError(f"No valid selector candidates for: {raw_selector}")
 
-    def _candidate_timeout_seconds(self, candidate_count: int) -> float:
+    async def _live_page_selector_candidates(
+        self,
+        *,
+        raw_selector: str,
+        step_type: str,
+        text_hint: str | None,
+    ) -> list[str]:
+        if step_type not in {"click", "type", "select", "wait", "verify_text", "handle_popup"}:
+            return []
+        try:
+            snapshot = await self._browser.inspect_page()
+        except Exception:
+            return []
+        return self._page_snapshot_selector_candidates(snapshot, raw_selector, step_type, text_hint)
+
+    def _page_snapshot_selector_candidates(
+        self,
+        snapshot: dict[str, Any],
+        raw_selector: str,
+        step_type: str,
+        text_hint: str | None,
+    ) -> list[str]:
+        elements = snapshot.get("interactive_elements")
+        if not isinstance(elements, list):
+            return []
+
+        target_terms = self._selector_search_terms(raw_selector, text_hint)
+        if not target_terms:
+            return []
+
+        ranked: list[tuple[int, list[str]]] = []
+        for item in elements:
+            if not isinstance(item, dict):
+                continue
+            score = self._snapshot_match_score(item, target_terms, step_type)
+            if score <= 0:
+                continue
+            selectors = item.get("selectors")
+            normalized: list[str] = []
+            if isinstance(selectors, list):
+                normalized.extend(str(selector).strip() for selector in selectors if str(selector).strip())
+            normalized.extend(self._selectors_from_snapshot_item(item, step_type))
+            normalized = self._dedupe(normalized)
+            if normalized:
+                ranked.append((score, normalized))
+
+        ranked.sort(key=lambda entry: entry[0], reverse=True)
+        flattened: list[str] = []
+        for _, selectors in ranked[:8]:
+            flattened.extend(selectors)
+        return self._dedupe(flattened)
+
+    def _selector_search_terms(self, raw_selector: str, text_hint: str | None) -> list[str]:
+        tokens: list[str] = []
+        for source in (raw_selector, text_hint or "", self._extract_selector_text(raw_selector) or ""):
+            lowered = source.strip().lower()
+            if not lowered:
+                continue
+            lowered = lowered.replace("{{selector.", " ").replace("}}", " ").replace("_", " ").replace("-", " ")
+            parts = re.findall(r"[a-z0-9]+", lowered)
+            for part in parts:
+                if len(part) >= 3 and part not in {"selector", "input", "button", "click", "type", "wait", "text"}:
+                    tokens.append(part)
+        return self._dedupe(tokens)
+
+    def _snapshot_match_score(self, item: dict[str, Any], target_terms: list[str], step_type: str) -> int:
+        haystack_parts = [
+            str(item.get("tag", "")),
+            str(item.get("type", "")),
+            str(item.get("text", "")),
+            str(item.get("aria", "")),
+            str(item.get("name", "")),
+            str(item.get("id", "")),
+            str(item.get("testid", "")),
+            str(item.get("role", "")),
+            str(item.get("placeholder", "")),
+            str(item.get("href", "")),
+            str(item.get("title", "")),
+        ]
+        haystack = " ".join(part.lower() for part in haystack_parts if part).strip()
+        if not haystack:
+            return 0
+
+        score = 0
+        for term in target_terms:
+            if term in haystack:
+                score += max(8, len(term))
+
+        tag = str(item.get("tag", "")).lower()
+        role = str(item.get("role", "")).lower()
+        if step_type in {"type", "select"}:
+            if tag in {"input", "textarea", "select"}:
+                score += 12
+            if role in {"textbox", "combobox"}:
+                score += 8
+        elif step_type in {"click", "handle_popup"}:
+            if tag in {"button", "a"}:
+                score += 12
+            if role in {"button", "link", "menuitem", "tab", "combobox"}:
+                score += 8
+        elif step_type in {"wait", "verify_text"}:
+            score += 4
+
+        language_intent = any(term in {"language", "locale", "lang"} for term in target_terms)
+        if language_intent:
+            text_value = str(item.get("text", "")).strip()
+            uppercase_code = len(text_value) <= 5 and text_value.isupper()
+            if any(token in haystack for token in ("language", "locale", "lang")):
+                score += 20
+            if tag in {"button", "select"}:
+                score += 10
+            if role in {"button", "combobox", "menuitem"}:
+                score += 10
+            if uppercase_code:
+                score += 14
+
+        return score
+
+    def _selectors_from_snapshot_item(self, item: dict[str, Any], step_type: str) -> list[str]:
+        selectors: list[str] = []
+        tag = str(item.get("tag", "")).strip().lower()
+        role = str(item.get("role", "")).strip()
+        item_id = str(item.get("id", "")).strip()
+        name = str(item.get("name", "")).strip()
+        testid = str(item.get("testid", "")).strip()
+        aria = str(item.get("aria", "")).strip()
+        placeholder = str(item.get("placeholder", "")).strip()
+        text = str(item.get("text", "")).strip()
+        title = str(item.get("title", "")).strip()
+
+        if item_id:
+            selectors.append(f"#{item_id}")
+        if testid:
+            selectors.append(f'[data-testid="{self._escape_playwright_text(testid)}"]')
+        if name and tag in {"input", "textarea", "select"}:
+            selectors.append(f'{tag}[name="{self._escape_playwright_text(name)}"]')
+        if aria:
+            escaped_aria = self._escape_playwright_text(aria[:60])
+            if tag:
+                selectors.append(f'{tag}[aria-label*="{escaped_aria}"]')
+            if role:
+                selectors.append(f'[role="{self._escape_playwright_text(role)}"][aria-label*="{escaped_aria}"]')
+            selectors.append(f'[aria-label*="{escaped_aria}"]')
+        if title:
+            selectors.append(f'[title*="{self._escape_playwright_text(title[:60])}"]')
+        if placeholder and tag in {"input", "textarea"}:
+            selectors.append(f'{tag}[placeholder*="{self._escape_playwright_text(placeholder[:60])}"]')
+        if text:
+            escaped_text = self._escape_playwright_text(text[:80])
+            if step_type in {"click", "handle_popup"}:
+                if tag == "button":
+                    selectors.append(f'button:has-text("{escaped_text}")')
+                elif tag == "select":
+                    selectors.append(f'select:has-text("{escaped_text}")')
+                elif tag == "a":
+                    selectors.append(f'a:has-text("{escaped_text}")')
+                elif role:
+                    selectors.append(f'[role="{self._escape_playwright_text(role)}"]:has-text("{escaped_text}")')
+            selectors.append(f"text={text[:80]}")
+
+        return self._dedupe(selectors)
+
+    def _candidate_timeout_seconds(self, candidate_count: int, step_type: str | None = None) -> float:
         step_timeout = max(float(self._settings.step_timeout_seconds), 1.0)
         if candidate_count <= 1:
+            if step_type == "type":
+                return min(step_timeout, 6.0)
+            if step_type == "click":
+                return min(step_timeout, 8.0)
             return step_timeout
         budget = max(step_timeout - 0.5, 1.0)
         per_candidate = budget / candidate_count
+        if step_type == "type":
+            per_candidate = min(per_candidate, 4.0)
+        if step_type == "click":
+            per_candidate = min(per_candidate, 5.0)
         return max(min(per_candidate, step_timeout), 1.0)
 
     def _selector_candidates(
@@ -924,7 +1594,7 @@ class AgentExecutor:
 
         if step_type == "type" and text_hint:
             hint_lower = text_hint.lower()
-            if "@" in text_hint or "email" in hint_lower:
+            if "email" in hint_lower:
                 keys.insert(0, "email")
                 keys.append("username")
             if "password" in hint_lower:
@@ -968,6 +1638,8 @@ class AgentExecutor:
         if step_type == "click":
             if any(token in selector_lower for token in ("login", "sign in", "signin", "log in")):
                 keys.insert(0, "login_button")
+            if any(token in selector_lower for token in ("language", "locale", "change language", "change locale", "lang")):
+                keys.insert(0, "language_switcher")
             if "create form" in selector_lower or "create_form" in selector_lower or "createform" in selector_lower:
                 keys.insert(0, "create_form")
             if "create workflow" in selector_lower or "create_workflow" in selector_lower or "createworkflow" in selector_lower:
@@ -1081,22 +1753,25 @@ class AgentExecutor:
             "dropdown_option_add_button",
         }
         for key in ordered_keys:
+            # Prefer remembered selectors that already succeeded on this domain,
+            # except for brittle dropdown modal actions where profile selectors are safer.
+            if key not in strict_dropdown_keys:
+                candidates.extend(self._memory_candidates(run_domain, step_type, key))
             profile_candidates = self._merge_profile_candidates(key, selector_profile)
             for candidate in profile_candidates:
                 normalized = self._apply_template(candidate, test_data).strip()
                 if normalized:
                     candidates.append(normalized)
-            # For brittle dropdown modal actions, do not let stale selector-memory
-            # candidates override exact profile selectors.
-            if key not in strict_dropdown_keys:
-                candidates.extend(self._memory_candidates(run_domain, step_type, key))
 
         if not alias_key:
             candidates.extend(self._memory_candidates(run_domain, step_type, selector))
             candidates.append(selector)
             candidates.extend(self._derive_selector_variants(selector, step_type))
 
-        deduped = self._dedupe(candidates)
+        if step_type == "type":
+            deduped = self._dedupe([selector] + candidates)
+        else:
+            deduped = self._dedupe(candidates)
         if candidates_from_hint:
             deduped = self._dedupe(candidates_from_hint + deduped)
         if step_type == "drag":
@@ -1280,6 +1955,11 @@ class AgentExecutor:
                 "type=\"email\"",
                 "autocomplete='email'",
                 "autocomplete=\"email\"",
+                "placeholder*='email'",
+                "placeholder*=\"email\"",
+                "aria-label*='email'",
+                "aria-label*=\"email\"",
+                "enter email",
             )
             filtered = [
                 candidate
@@ -1613,6 +2293,49 @@ class AgentExecutor:
             variants.append(selector.replace(":nth-child(1)", ""))
 
         selector_lower = selector.lower()
+        if step_type == "click":
+            text_button_match = re.fullmatch(r"button:has-text\((['\"])(.*?)\1\)", selector, re.IGNORECASE)
+            if text_button_match:
+                text_value = text_button_match.group(2).strip()
+                escaped = self._escape_playwright_text(text_value)
+                variants.extend(
+                    [
+                        f'a:has-text("{escaped}")',
+                        f'[role="button"]:has-text("{escaped}")',
+                        f':text-is("{escaped}")',
+                        f"text={text_value}",
+                    ]
+                )
+            text_link_match = re.fullmatch(r"a:has-text\((['\"])(.*?)\1\)", selector, re.IGNORECASE)
+            if text_link_match:
+                text_value = text_link_match.group(2).strip()
+                escaped = self._escape_playwright_text(text_value)
+                variants.extend(
+                    [
+                        f'button:has-text("{escaped}")',
+                        f'[role="button"]:has-text("{escaped}")',
+                        f':text-is("{escaped}")',
+                        f"text={text_value}",
+                    ]
+                )
+            aria_button_match = re.fullmatch(
+                r"button\[aria-label=(['\"])(.*?)\1\]",
+                selector,
+                re.IGNORECASE,
+            )
+            if aria_button_match:
+                aria_value = aria_button_match.group(2).strip()
+                escaped = self._escape_playwright_text(aria_value)
+                variants.extend(
+                    [
+                        f'[aria-label*="{escaped}"]',
+                        f'[role="button"][aria-label*="{escaped}"]',
+                        f'button[title*="{escaped}"]',
+                    ]
+                )
+                if any(token in aria_value.lower() for token in ("language", "locale", "lang")):
+                    variants.extend(self._merge_profile_candidates("language_switcher", {}))
+
         if "s-main-slot" in selector_lower or "s-search-result" in selector_lower:
             variants.extend(
                 [
@@ -1852,15 +2575,94 @@ class AgentExecutor:
             return f"{text[:217]}..."
         return text
 
+    @staticmethod
+    def _should_request_selector_help(step: StepRuntimeState, exc: Exception) -> bool:
+        if step.type not in {"click", "type", "select", "wait", "handle_popup", "verify_text"}:
+            return False
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            return step.type == "click"
+        message = str(exc).lower()
+        selector_failure_markers = (
+            "all selector candidates failed",
+            "no valid selector candidates",
+            "no selector candidates available",
+        )
+        actionable_markers = (
+            "timeout",
+            "waiting for",
+            "locator.",
+            "element",
+            "not found",
+            "not visible",
+            "strict mode violation",
+            "would receive the click",
+            "unexpected token",
+            "parsing css selector",
+        )
+        if step.type == "click":
+            click_markers = selector_failure_markers + actionable_markers + (
+                "click failed for",
+                "locator.click",
+                "not attached",
+                "intercept",
+                "another element would receive the click",
+                "resolved to 0 elements",
+                "blocked=",
+                "in_iframe=",
+            )
+            return any(marker in message for marker in click_markers)
+        if any(marker in message for marker in selector_failure_markers):
+            return True
+        if not any(marker in message for marker in selector_failure_markers):
+            return False
+        return any(marker in message for marker in actionable_markers)
+
+    @staticmethod
+    def _requested_selector_target(step: StepRuntimeState) -> str | None:
+        original = step.input.get("_selector_help_original")
+        if isinstance(original, str) and original.strip():
+            return original.strip()
+        raw_selector = step.input.get("selector")
+        if isinstance(raw_selector, str) and raw_selector.strip():
+            return raw_selector.strip()
+        return None
+
+    def _build_selector_help_prompt(self, step: StepRuntimeState) -> str:
+        requested = self._requested_selector_target(step) or "the missing element"
+        action_label = step.type.replace("_", " ")
+        last_attempt = ""
+        if step.provided_selector:
+            last_attempt = (
+                f" The last selector you provided also did not work: {step.provided_selector}. "
+                "Please try a different Playwright selector."
+            )
+        return (
+            f"The agent could not find a working selector for the {action_label} step. "
+            f"Please provide a Playwright selector for {requested} so the run can continue."
+            f"{last_attempt}"
+        )
+
     def _memory_candidates(self, run_domain: str | None, step_type: str, key: str) -> list[str]:
         store = self._selector_memory
         if not store or not run_domain:
             return []
-        key_token = key.strip()
-        if not key_token:
+        lookup_keys = self._selector_memory_lookup_keys(key)
+        lookup_keys.extend(self._semantic_selector_memory_keys(step_type, key))
+        lookup_keys = self._dedupe(lookup_keys)
+        if not lookup_keys:
             return []
         max_items = max(int(getattr(self._settings, "selector_memory_max_candidates", 5)), 1)
-        return store.get_candidates(run_domain, step_type, key_token, limit=max_items)
+        candidates: list[str] = []
+        for key_token in lookup_keys:
+            candidates.extend(store.get_candidates(run_domain, step_type, key_token, limit=max_items))
+        filtered = [
+            candidate
+            for candidate in candidates
+            if not self._is_unsafe_memory_selector(candidate)
+        ]
+        filtered = self._filter_memory_candidates(step_type, key, filtered)
+        deduped = self._dedupe(filtered)
+        return sorted(deduped, key=lambda candidate: self._memory_selector_priority(step_type, key, candidate))
 
     def _remember_selector_success(
         self,
@@ -1874,11 +2676,14 @@ class AgentExecutor:
         store = self._selector_memory
         if not store or not run_domain:
             return
+        if self._is_unsafe_memory_selector(resolved_selector):
+            return
 
-        keys = [raw_selector.strip()]
+        keys = self._selector_memory_lookup_keys(raw_selector)
         alias = self._selector_alias_key(raw_selector)
         if alias:
-            keys.append(alias)
+            keys.extend(self._selector_memory_lookup_keys(alias))
+        keys.extend(self._semantic_selector_memory_keys(step_type, raw_selector))
 
         selector_lower = raw_selector.lower()
         if step_type == "type":
@@ -1935,6 +2740,143 @@ class AgentExecutor:
             store.remember_success(run_domain, step_type, key, resolved_selector)
 
     @staticmethod
+    def _selector_memory_lookup_keys(key: str) -> list[str]:
+        raw = key.strip()
+        if not raw:
+            return []
+
+        compact = " ".join(raw.split())
+        single_quoted = compact.replace('"', "'")
+        variants = [raw, compact, single_quoted]
+        lowered_variants = [item.lower() for item in variants]
+        return AgentExecutor._dedupe(variants + lowered_variants)
+
+    def _semantic_selector_memory_keys(self, step_type: str, selector: str) -> list[str]:
+        if step_type not in {"click", "verify_text"}:
+            return []
+
+        text_value = self._extract_selector_text(selector)
+        if not text_value:
+            return []
+
+        normalized = " ".join(text_value.strip().lower().split())
+        if not normalized:
+            return []
+
+        return [
+            f"text::{normalized}",
+            f"{step_type}::text::{normalized}",
+        ]
+
+    @staticmethod
+    def _extract_selector_text(selector: str) -> str | None:
+        text = selector.strip()
+        patterns = (
+            r":has-text\((['\"])(.*?)\1\)",
+            r":text\((['\"])(.*?)\1\)",
+            r":text-is\((['\"])(.*?)\1\)",
+            r"^text=(.+)$",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                value = match.group(2) if match.lastindex and match.lastindex >= 2 else match.group(1)
+                normalized = value.strip().strip("'\"")
+                if normalized:
+                    return normalized
+        return None
+
+    @staticmethod
+    def _is_unsafe_memory_selector(selector: str) -> bool:
+        token = selector.strip().lower()
+        return token in {
+            "html",
+            "body",
+            "xpath=//html",
+            "xpath=/html",
+            "xpath=//body",
+            "xpath=/body",
+        } or token.startswith("html.") or token.startswith("body.")
+
+    @staticmethod
+    def _filter_memory_candidates(step_type: str, key: str, candidates: list[str]) -> list[str]:
+        if step_type != "click":
+            return candidates
+
+        key_lower = key.strip().lower()
+        expects_button_like_target = any(
+            token in key_lower
+            for token in (
+                "button",
+                ":has-text(",
+                ":text(",
+                "text=",
+                "login",
+                "sign up",
+                "sign in",
+                "workflows",
+                "english",
+                "de",
+                "continue",
+                "next",
+                "submit",
+                "save",
+            )
+        )
+        if not expects_button_like_target:
+            return candidates
+
+        blocked_prefixes = ("input", "textarea", "select")
+        blocked_fragments = (
+            "@placeholder=",
+            "[@placeholder=",
+            "placeholder=",
+            "enter email",
+            "enter password",
+        )
+        filtered = []
+        for candidate in candidates:
+            lowered = candidate.strip().lower()
+            if lowered.startswith(blocked_prefixes):
+                continue
+            if any(fragment in lowered for fragment in blocked_fragments):
+                continue
+            filtered.append(candidate)
+        return filtered or candidates
+
+    @staticmethod
+    def _memory_selector_priority(step_type: str, key: str, selector: str) -> tuple[int, int, int, str]:
+        lowered = selector.strip().lower()
+        stability = 80
+
+        if any(token in lowered for token in ("data-testid", "data-test", "data-qa")):
+            stability = 0
+        elif lowered.startswith("#") or "[id=" in lowered or "#".join(lowered.split()[:1]).startswith("#"):
+            stability = 5
+        elif any(token in lowered for token in ("[name=", "name='", 'name="', "aria-label", "role=")):
+            stability = 10
+        elif any(token in lowered for token in ("has-text(", ":text(", "text=", ":text-is(")):
+            stability = 15
+        elif lowered.startswith("xpath="):
+            stability = 60
+
+        if "\\." in lowered or lowered.count(".") >= 4:
+            stability += 18
+        if ":visible" in lowered:
+            stability += 6
+        if len(lowered) > 140:
+            stability += 12
+
+        key_lower = key.strip().lower()
+        semantic_penalty = 0
+        if step_type == "click":
+            if any(token in key_lower for token in ("button", ":has-text(", ":text(", "text=", "login", "save", "submit")):
+                if lowered.startswith(("input", "textarea", "select")) or "placeholder=" in lowered:
+                    semantic_penalty = 40
+
+        return (semantic_penalty, stability, len(lowered), lowered)
+
+    @staticmethod
     def _extract_run_domain(run: RunState) -> str | None:
         candidate_urls: list[str] = []
         if run.start_url:
@@ -1973,6 +2915,12 @@ class AgentExecutor:
             return "Passed", "run-passed"
         if status == RunStatus.failed:
             return "Failed", "run-failed"
+        if status == RunStatus.waiting_for_input:
+            return "Needs Input", "run-skipped"
+        if status == RunStatus.running:
+            return "Running", "run-skipped"
+        if status == RunStatus.cancelled:
+            return "Cancelled", "run-skipped"
         return "Skipped", "run-skipped"
 
     @staticmethod
@@ -1981,6 +2929,14 @@ class AgentExecutor:
             return "Passed", "step-passed"
         if status == StepStatus.failed:
             return "Failed", "step-failed"
+        if status == StepStatus.waiting_for_input:
+            return "Needs Input", "step-skipped"
+        if status == StepStatus.running:
+            return "Running", "step-skipped"
+        if status == StepStatus.cancelled:
+            return "Cancelled", "step-skipped"
+        if status == StepStatus.pending:
+            return "Pending", "step-skipped"
         return "Skipped", "step-skipped"
 
     @staticmethod

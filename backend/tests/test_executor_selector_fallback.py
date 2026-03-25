@@ -8,6 +8,7 @@ import pytest
 
 from app.runtime.executor import AgentExecutor
 from app.runtime.selector_memory import InMemorySelectorMemoryStore
+from app.schemas import RunState, RunStatus, StepRuntimeState, StepStatus
 
 
 def _executor(step_timeout_seconds: int = 15) -> AgentExecutor:
@@ -22,6 +23,19 @@ def _executor(step_timeout_seconds: int = 15) -> AgentExecutor:
     return executor
 
 
+class _RunStore:
+    def __init__(self, run: RunState | None = None) -> None:
+        self._run = run
+
+    def get(self, run_id: str) -> RunState | None:
+        if self._run and self._run.run_id == run_id:
+            return self._run
+        return None
+
+    def persist(self, run: RunState) -> None:
+        self._run = run
+
+
 def test_selector_candidates_use_default_email_profile() -> None:
     executor = _executor()
     candidates = executor._selector_candidates(
@@ -33,9 +47,115 @@ def test_selector_candidates_use_default_email_profile() -> None:
         text_hint="qa@example.com",
     )
 
-    assert candidates[0] == "#username"
+    assert candidates[0] == "input[type='email']"
     assert "input[name='username']" in candidates
     assert "input[type='email']" in candidates
+
+
+def test_type_selector_candidates_prioritize_explicit_selector_before_email_aliases() -> None:
+    executor = _executor()
+    candidates = executor._selector_candidates(
+        raw_selector="input[name='email']",
+        step_type="type",
+        selector_profile={},
+        test_data={},
+        run_domain=None,
+        text_hint="qa@example.com",
+    )
+
+    assert candidates[0] == "input[name='email']"
+    assert "#username" in candidates
+
+
+def test_password_candidates_do_not_infer_email_from_password_value() -> None:
+    executor = _executor()
+    candidates = executor._selector_candidates(
+        raw_selector="input[name='password']",
+        step_type="type",
+        selector_profile={},
+        test_data={},
+        run_domain=None,
+        text_hint="Madhu@123",
+    )
+
+    assert candidates[0] == "input[name='password']"
+    assert "input[placeholder*='Email']" not in candidates
+
+
+def test_memory_candidates_match_selector_case_and_quote_variants() -> None:
+    executor = _executor()
+    memory = InMemorySelectorMemoryStore()
+    memory.remember_success(
+        "app.stag.dr-adem.com",
+        "click",
+        "button:has-text('english')",
+        "button:has-text('English')",
+    )
+    executor._selector_memory = memory
+
+    candidates = executor._memory_candidates(
+        "app.stag.dr-adem.com",
+        "click",
+        'button:has-text("English")',
+    )
+
+    assert "button:has-text('English')" in candidates
+
+
+def test_click_memory_candidates_match_across_text_selector_forms() -> None:
+    executor = _executor()
+    memory = InMemorySelectorMemoryStore()
+    memory.remember_success(
+        "app.stag.dr-adem.com",
+        "click",
+        "text::sign up",
+        "button.text-\\[12px\\].font-ibm-plex.font-medium.text-black.underline.ml-1.hover\\:opacity-80:visible",
+    )
+    executor._selector_memory = memory
+
+    candidates = executor._memory_candidates(
+        "app.stag.dr-adem.com",
+        "click",
+        'button:has-text("Sign Up")',
+    )
+
+    assert "button.text-\\[12px\\].font-ibm-plex.font-medium.text-black.underline.ml-1.hover\\:opacity-80:visible" in candidates
+
+
+def test_click_alias_candidates_prefer_remembered_selector_before_profile_defaults() -> None:
+    executor = _executor()
+    memory = InMemorySelectorMemoryStore()
+    memory.remember_success(
+        "app.stag.dr-adem.com",
+        "click",
+        "login_button",
+        "[data-testid='login-button']",
+    )
+    executor._selector_memory = memory
+
+    candidates = executor._selector_candidates(
+        raw_selector="{{selector.login_button}}",
+        step_type="click",
+        selector_profile={},
+        test_data={},
+        run_domain="app.stag.dr-adem.com",
+    )
+
+    assert candidates[0] == "[data-testid='login-button']"
+    assert "button:has-text('Login')" in candidates
+
+
+def test_memory_candidates_skip_unsafe_root_level_selectors() -> None:
+    executor = _executor()
+    memory = InMemorySelectorMemoryStore()
+    memory.remember_success("app.stag.dr-adem.com", "click", "cta", "xpath=//body")
+    memory.remember_success("app.stag.dr-adem.com", "click", "cta", "button:has-text('Continue')")
+    executor._selector_memory = memory
+
+    candidates = executor._memory_candidates("app.stag.dr-adem.com", "click", "cta")
+
+    assert "xpath=//body" not in candidates
+    assert "button:has-text('Continue')" in candidates
 
 
 def test_selector_fallback_tries_multiple_candidates() -> None:
@@ -61,8 +181,8 @@ def test_selector_fallback_tries_multiple_candidates() -> None:
     )
 
     assert result == "Typed into input[name='username'] (after clear)"
-    assert attempted[0] == "#username"
-    assert attempted[1] == "input[name='username']"
+    assert attempted[0] == "input[type='email']"
+    assert attempted[1] == "#username"
 
 
 def test_selector_fallback_error_lists_attempts() -> None:
@@ -90,6 +210,126 @@ def test_selector_fallback_error_lists_attempts() -> None:
     assert "input[type='email']" in message
 
 
+def test_execute_step_switches_to_waiting_for_input_on_selector_failure() -> None:
+    executor = _executor(step_timeout_seconds=4)
+
+    async def _raise_selector_error(run: RunState, raw_step: dict) -> str:
+        raise ValueError("All selector candidates failed: pass 1: button:has-text('Workflows') -> timeout")
+
+    executor._dispatch_step = _raise_selector_error
+    executor._files = SimpleNamespace(
+        write_text_artifact=lambda *args, **kwargs: None,
+        write_bytes_artifact=lambda *args, **kwargs: None,
+    )
+    executor._capture_failure_screenshot = lambda *args, **kwargs: asyncio.sleep(0)
+
+    run = RunState(run_name="selector-help-run", steps=[])
+    step = StepRuntimeState(
+        index=0,
+        type="click",
+        input={"type": "click", "selector": "button:has-text('Workflows')"},
+    )
+
+    asyncio.run(executor._execute_step(run, step))
+
+    assert step.status == StepStatus.waiting_for_input
+    assert step.user_input_kind == "selector"
+    assert "Please provide a Playwright selector" in (step.user_input_prompt or "")
+    assert step.requested_selector_target == "button:has-text('Workflows')"
+
+
+def test_click_selector_parse_error_still_requests_selector_help() -> None:
+    executor = _executor(step_timeout_seconds=4)
+
+    async def _raise_selector_error(run: RunState, raw_step: dict) -> str:
+        raise ValueError(
+            'All selector candidates failed: pass 1: page.get_by_text("Workflows", exact=True) '
+            '-> Unexpected token "get_by_text(" while parsing css selector'
+        )
+
+    executor._dispatch_step = _raise_selector_error
+    executor._files = SimpleNamespace(
+        write_text_artifact=lambda *args, **kwargs: None,
+        write_bytes_artifact=lambda *args, **kwargs: None,
+    )
+    executor._capture_failure_screenshot = lambda *args, **kwargs: asyncio.sleep(0)
+
+    run = RunState(run_name="selector-help-run", steps=[])
+    step = StepRuntimeState(
+        index=0,
+        type="click",
+        input={"type": "click", "selector": 'page.get_by_text("Workflows", exact=True)'},
+    )
+
+    asyncio.run(executor._execute_step(run, step))
+
+    assert step.status == StepStatus.waiting_for_input
+    assert step.user_input_kind == "selector"
+
+
+def test_execute_type_step_fails_on_plain_timeout_without_selector_resolution_error() -> None:
+    executor = _executor(step_timeout_seconds=1)
+
+    async def _hang(run: RunState, raw_step: dict) -> str:
+        await asyncio.sleep(2)
+        return "never"
+
+    executor._dispatch_step = _hang
+    executor._files = SimpleNamespace(
+        write_text_artifact=lambda *args, **kwargs: None,
+        write_bytes_artifact=lambda *args, **kwargs: None,
+    )
+    executor._capture_failure_screenshot = lambda *args, **kwargs: asyncio.sleep(0)
+
+    run = RunState(run_name="selector-help-run", steps=[])
+    step = StepRuntimeState(
+        index=0,
+        type="type",
+        input={"type": "type", "selector": "input[name='email']", "text": "qa@example.com"},
+    )
+
+    asyncio.run(executor._execute_step(run, step))
+
+    assert step.status == StepStatus.failed
+    assert step.user_input_kind is None
+    assert step.requested_selector_target is None
+
+
+def test_apply_manual_selector_hint_updates_step_without_premature_selector_memory() -> None:
+    executor = _executor()
+    memory = InMemorySelectorMemoryStore()
+    run = RunState(
+        run_id="run-1",
+        run_name="selector-help-run",
+        start_url="https://test.vitaone.io/workflows",
+        status=RunStatus.waiting_for_input,
+        steps=[
+            StepRuntimeState(
+                step_id="step-1",
+                index=0,
+                type="click",
+                input={"type": "click", "selector": "button:has-text('Workflows')"},
+                status=StepStatus.waiting_for_input,
+                user_input_kind="selector",
+                requested_selector_target="button:has-text('Workflows')",
+            )
+        ],
+    )
+    executor._run_store = _RunStore(run)
+    executor._selector_memory = memory
+
+    updated = executor.apply_manual_selector_hint("run-1", "step-1", "a:has-text('Workflows')")
+
+    assert updated is not None
+    step = updated.steps[0]
+    assert step.status == StepStatus.pending
+    assert step.input["selector"] == "a:has-text('Workflows')"
+    assert step.provided_selector == "a:has-text('Workflows')"
+    remembered = memory.get_candidates("test.vitaone.io", "click", "button:has-text('Workflows')")
+    assert remembered == []
+    assert step.input["_selector_help_original"] == "button:has-text('Workflows')"
+
+
 def test_selector_variants_include_id_case_and_contains_conversions() -> None:
     executor = _executor()
     candidates = executor._selector_candidates(
@@ -104,6 +344,23 @@ def test_selector_variants_include_id_case_and_contains_conversions() -> None:
     assert 'button#createForm:contains("Create Form")' in candidates
     assert 'button#create_form:has-text("Create Form")' in candidates
     assert "text=Create Form" in candidates
+
+
+def test_click_text_selector_variants_include_link_and_text_fallbacks() -> None:
+    executor = _executor()
+    candidates = executor._selector_candidates(
+        raw_selector="button:has-text('Sign Up')",
+        step_type="click",
+        selector_profile={},
+        test_data={},
+        run_domain=None,
+    )
+
+    assert "button:has-text('Sign Up')" in candidates
+    assert 'a:has-text("Sign Up")' in candidates
+    assert '[role="button"]:has-text("Sign Up")' in candidates
+    assert ':text-is("Sign Up")' in candidates
+    assert "text=Sign Up" in candidates
 
 
 def test_selector_variants_include_amazon_result_fallbacks() -> None:
@@ -285,6 +542,65 @@ def test_selector_memory_prioritizes_previous_successes() -> None:
     assert candidates[0] == "button#createForm"
 
 
+def test_selector_memory_prefers_stable_click_selector_over_brittle_css() -> None:
+    executor = _executor()
+    memory = InMemorySelectorMemoryStore()
+    memory.remember_success(
+        "test.vitaone.io",
+        "click",
+        "button:has-text('Login')",
+        "button.flex.items-center.gap-1\\.5.rounded-md.text-white:visible",
+    )
+    memory.remember_success(
+        "test.vitaone.io",
+        "click",
+        "button:has-text('Login')",
+        "button:has-text('Login')",
+    )
+    executor._selector_memory = memory
+
+    candidates = executor._memory_candidates(
+        "test.vitaone.io",
+        "click",
+        "button:has-text('Login')",
+    )
+
+    assert candidates[0] == "button:has-text('Login')"
+
+
+def test_click_candidate_timeout_is_capped_for_single_candidate() -> None:
+    executor = _executor(step_timeout_seconds=60)
+
+    assert executor._candidate_timeout_seconds(1, step_type="click") == 8.0
+
+
+def test_click_memory_candidates_exclude_form_fields_for_button_like_targets() -> None:
+    executor = _executor()
+    memory = InMemorySelectorMemoryStore()
+    memory.remember_success(
+        "test.vitaone.io",
+        "click",
+        "button:has-text('English')",
+        "xpath=//input[@placeholder='Enter email']",
+    )
+    memory.remember_success(
+        "test.vitaone.io",
+        "click",
+        "button:has-text('English')",
+        "button:has-text('English')",
+    )
+    executor._selector_memory = memory
+
+    candidates = executor._memory_candidates(
+        "test.vitaone.io",
+        "click",
+        "button:has-text('English')",
+    )
+
+    assert "xpath=//input[@placeholder='Enter email']" not in candidates
+    assert candidates[0] == "button:has-text('English')"
+
+
 def test_selector_fallback_retries_transient_timeout_and_recovers() -> None:
     executor = _executor(step_timeout_seconds=4)
     call_count = 0
@@ -359,6 +675,121 @@ def test_login_click_timeout_recovers_when_create_form_appears() -> None:
     )
 
     assert result == "Login click likely succeeded; Create Form became visible"
+
+
+def test_login_click_hang_recovers_before_outer_step_timeout() -> None:
+    executor = _executor(step_timeout_seconds=6)
+
+    class _Browser:
+        async def click(self, selector: str) -> str:
+            await asyncio.sleep(3.5)
+            return f"Clicked {selector}"
+
+        async def wait_for(
+            self,
+            *,
+            until: str,
+            ms: int,
+            selector: str | None = None,
+            load_state: str | None = None,
+        ) -> str:
+            if selector == "button#createForm":
+                return "visible"
+            raise TimeoutError(f"Missing {selector}")
+
+    executor._browser = _Browser()
+
+    result = asyncio.run(
+        executor._dispatch_step(
+            SimpleNamespace(test_data={}, selector_profile={}, start_url=None, steps=[]),
+            {
+                "type": "click",
+                "selector": "{{selector.login_button}}",
+            },
+        )
+    )
+
+    assert result == "Login click likely succeeded; Create Form became visible"
+
+
+def test_transition_canvas_click_short_circuits_when_label_is_visible() -> None:
+    executor = _executor(step_timeout_seconds=6)
+
+    class _Browser:
+        async def wait_for(
+            self,
+            *,
+            until: str,
+            ms: int,
+            selector: str | None = None,
+            load_state: str | None = None,
+        ) -> str:
+            if selector == "text=Transition_20260320_123745":
+                return "visible"
+            raise TimeoutError(f"Missing {selector}")
+
+        async def click(self, selector: str) -> str:
+            raise AssertionError("click should not be attempted when transition label is already visible")
+
+    executor._browser = _Browser()
+
+    result = asyncio.run(
+        executor._dispatch_step(
+            SimpleNamespace(
+                test_data={"NOW_YYYYMMDD_HHMMSS": "20260320_123745"},
+                selector_profile={},
+                start_url=None,
+                steps=[],
+            ),
+            {
+                "type": "click",
+                "selector": "{{selector.transition_canvas_label}}",
+                "text_hint": "Tranisition_{{NOW_YYYYMMDD_HHMMSS}}",
+            },
+        )
+    )
+
+    assert result == "Transition label is visible on canvas"
+
+
+def test_transition_canvas_click_becomes_non_blocking_when_editor_is_visible() -> None:
+    executor = _executor(step_timeout_seconds=6)
+
+    class _Browser:
+        async def wait_for(
+            self,
+            *,
+            until: str,
+            ms: int,
+            selector: str | None = None,
+            load_state: str | None = None,
+        ) -> str:
+            if selector == "button:has-text('Save Changes')":
+                return "visible"
+            raise TimeoutError(f"Missing {selector}")
+
+        async def click(self, selector: str) -> str:
+            raise AssertionError("click should not be attempted when transition click is treated as non-blocking")
+
+    executor._browser = _Browser()
+
+    result = asyncio.run(
+        executor._dispatch_step(
+            SimpleNamespace(
+                test_data={"NOW_YYYYMMDD_HHMMSS": "20260320_155646"},
+                selector_profile={},
+                start_url=None,
+                steps=[],
+            ),
+            {
+                "type": "click",
+                "selector": "{{selector.transition_canvas_label}}",
+                "text_hint": "Tranisition_{{NOW_YYYYMMDD_HHMMSS}}",
+            },
+        )
+    )
+
+    assert result == "Transition canvas click treated as non-blocking"
 
 
 def test_email_candidates_exclude_password_selectors_from_memory() -> None:

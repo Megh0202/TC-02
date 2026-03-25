@@ -343,6 +343,36 @@
   color: var(--ink-700);
 }
 
+.helpCard {
+  margin-top: 10px;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(180, 83, 9, 0.24);
+  background: rgba(255, 247, 237, 0.88);
+  display: grid;
+  gap: 8px;
+}
+
+.inlineHelpCard {
+  margin-top: 8px;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px dashed rgba(180, 83, 9, 0.3);
+  background: rgba(255, 247, 237, 0.72);
+  display: grid;
+  gap: 8px;
+}
+
+.helpTitle {
+  color: #9a3412;
+  font-weight: 700;
+}
+
+.helpText {
+  color: var(--ink-700);
+  line-height: 1.45;
+}
+
 .timeline {
   margin-top: 10px;
   display: grid;
@@ -388,6 +418,11 @@
 .statusRunning {
   background: rgba(245, 158, 11, 0.18);
   color: #92400e;
+}
+
+.statusWaiting {
+  background: rgba(249, 115, 22, 0.16);
+  color: #9a3412;
 }
 
 .statusCompleted {

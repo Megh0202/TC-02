@@ -17,15 +17,21 @@ type RuntimeStep = {
   step_id: string;
   index: number;
   type: string;
-  status: "pending" | "running" | "completed" | "failed" | "cancelled";
+  status: "pending" | "running" | "waiting_for_input" | "completed" | "failed" | "cancelled";
   message?: string | null;
   error?: string | null;
+  user_input_kind?: string | null;
+  user_input_prompt?: string | null;
+  requested_selector_target?: string | null;
+  provided_selector?: string | null;
 };
 
 type RunState = {
   run_id: string;
   run_name: string;
-  status: "pending" | "running" | "completed" | "failed" | "cancelled";
+  status: "pending" | "running" | "waiting_for_input" | "completed" | "failed" | "cancelled";
+  prompt?: string | null;
+  execution_mode?: "plan" | "autonomous";
   summary?: string | null;
   report_artifact?: string | null;
   steps: RuntimeStep[];
@@ -114,6 +120,7 @@ function statusClass(status: RunState["status"] | RuntimeStep["status"] | undefi
   if (status === "completed") return styles.statusCompleted;
   if (status === "failed") return styles.statusFailed;
   if (status === "running") return styles.statusRunning;
+  if (status === "waiting_for_input") return styles.statusWaiting;
   if (status === "cancelled") return styles.statusCancelled;
   return styles.statusPending;
 }
@@ -153,6 +160,11 @@ function buildPromptFallbackFromSteps(steps: Record<string, unknown>[]): string 
     .join("\n");
 }
 
+function extractFirstUrl(text: string): string | null {
+  const match = text.match(/https?:\/\/[^\s]+/i);
+  return match ? match[0] : null;
+}
+
 function parseJsonObject(raw: string, label: string): JsonObject {
   const text = raw
     .replace(/\u2018|\u2019|\u2032/g, "'")
@@ -181,6 +193,46 @@ function buildPlanSignature(prompt: string, testDataInput: string, selectorProfi
   ].join("||");
 }
 
+function stepSupportsManualSelectorHelp(step: RuntimeStep): boolean {
+  if (step.user_input_kind === "selector" && step.status === "waiting_for_input") {
+    return true;
+  }
+  if (step.status !== "failed") {
+    return false;
+  }
+  if (!["click", "type", "select", "wait", "handle_popup", "verify_text"].includes(step.type)) {
+    return false;
+  }
+  const message = `${step.error ?? ""} ${step.message ?? ""}`.toLowerCase();
+  if (!message.trim()) {
+    return false;
+  }
+  const recoverableMarkers = [
+    "timeout",
+    "waiting for",
+    "locator.",
+    "element",
+    "not found",
+    "not visible",
+    "strict mode violation",
+    "would receive the click",
+    "unexpected token",
+    "parsing css selector",
+    "all selector candidates failed",
+    "no valid selector candidates",
+    "no selector candidates available",
+    "click failed for",
+    "locator.click",
+    "not attached",
+    "intercept",
+    "another element would receive the click",
+    "resolved to 0 elements",
+    "blocked=",
+    "in_iframe=",
+  ];
+  return recoverableMarkers.some((marker) => message.includes(marker));
+}
+
 export default function Home() {
   const [config, setConfig] = useState<AgentConfig | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
@@ -199,6 +251,8 @@ export default function Home() {
   const [runningCaseId, setRunningCaseId] = useState<string | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
   const [requestInfo, setRequestInfo] = useState<string | null>(null);
+  const [selectorHelpInput, setSelectorHelpInput] = useState("");
+  const [isSubmittingSelectorHelp, setIsSubmittingSelectorHelp] = useState(false);
   const [planPreview, setPlanPreview] = useState<PlanGenerateResponse | null>(null);
   const [importedPlan, setImportedPlan] = useState<StepImportResponse | null>(null);
   const [importFile, setImportFile] = useState<File | null>(null);
@@ -232,6 +286,17 @@ export default function Home() {
     }
     return SHOW_ADVANCED_INPUTS ? planPreview : null;
   }, [importedPlan, planPreview]);
+  const waitingStep = useMemo(
+    () =>
+      currentRun?.steps.find(
+        (step) => step.status === "waiting_for_input" && step.user_input_kind === "selector",
+      ) ?? null,
+    [currentRun],
+  );
+  const manualSelectorStep = useMemo(
+    () => currentRun?.steps.find((step) => stepSupportsManualSelectorHelp(step)) ?? null,
+    [currentRun],
+  );
 
   useEffect(() => {
     let disposed = false;
@@ -458,33 +523,28 @@ export default function Home() {
 
     try {
       setIsSubmitting(true);
-
-      let plan: PlanGenerateResponse;
-      if (importedPlan) {
-        plan = {
-          run_name: importedPlan.run_name,
-          start_url: importedPlan.start_url ?? null,
-          steps: importedPlan.steps,
-        };
-      } else {
-        const useCachedPlan = SHOW_ADVANCED_INPUTS && Boolean(planIsFresh && planPreview);
-        plan = useCachedPlan && planPreview ? planPreview : await requestPlan(task, testData, selectorProfile);
-        if (!useCachedPlan) {
-          setPlanPreview(plan);
-          setPlanSignature(buildPlanSignature(prompt, testDataInput, selectorProfileInput));
-        }
-      }
+      const runPayload = importedPlan
+        ? {
+            run_name: importedPlan.run_name || "prompt-run",
+            start_url: importedPlan.start_url ?? null,
+            steps: importedPlan.steps,
+            test_data: testData,
+            selector_profile: selectorProfile,
+          }
+        : {
+            run_name: "autonomous-browser-run",
+            start_url: extractFirstUrl(task),
+            prompt: task,
+            execution_mode: "autonomous",
+            steps: [],
+            test_data: testData,
+            selector_profile: selectorProfile,
+          };
 
       const runResponse = await fetch(`${API_BASE_URL}/api/runs`, {
         method: "POST",
         headers: buildApiHeaders({ json: true }),
-        body: JSON.stringify({
-          run_name: plan.run_name || "prompt-run",
-          start_url: plan.start_url ?? null,
-          steps: plan.steps,
-          test_data: testData,
-          selector_profile: selectorProfile,
-        }),
+        body: JSON.stringify(runPayload),
       });
       if (!runResponse.ok) {
         throw new Error(await parseError(runResponse));
@@ -637,6 +697,41 @@ export default function Home() {
       setRequestError(error instanceof Error ? error.message : "Failed to cancel run");
     } finally {
       setIsCancelling(false);
+    }
+  }
+
+  async function submitSelectorHelp(): Promise<void> {
+    if (!currentRun || !manualSelectorStep) return;
+    const selector = selectorHelpInput.trim();
+    if (!selector) {
+      setRequestError("Enter a selector before submitting help.");
+      return;
+    }
+
+    try {
+      setIsSubmittingSelectorHelp(true);
+      setRequestError(null);
+      setRequestInfo(null);
+
+      const response = await fetch(
+        `${API_BASE_URL}/api/runs/${currentRun.run_id}/steps/${manualSelectorStep.step_id}/selector`,
+        {
+          method: "POST",
+          headers: buildApiHeaders({ json: true }),
+          body: JSON.stringify({ selector }),
+        },
+      );
+      if (!response.ok) {
+        throw new Error(await parseError(response));
+      }
+      const payload = (await response.json()) as RunState;
+      setCurrentRun(payload);
+      setSelectorHelpInput("");
+      setRequestInfo("Selector received. The run is resuming from the blocked step.");
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "Failed to submit selector help");
+    } finally {
+      setIsSubmittingSelectorHelp(false);
     }
   }
 
@@ -902,6 +997,52 @@ export default function Home() {
 
               {currentRun.summary ? <p className={styles.summary}>{currentRun.summary}</p> : null}
 
+              {manualSelectorStep ? (
+                <div className={styles.helpCard}>
+                  <p className={styles.helpTitle}>Selector Help Needed</p>
+                  <p className={styles.stepError}>{manualSelectorStep.error}</p>
+                  <p className={styles.helpText}>
+                    {manualSelectorStep.user_input_prompt ??
+                      "Provide a Playwright selector for the element the agent could not find."}
+                  </p>
+                  <p className={styles.metaLine}>
+                    Tips: SelectorHub output can still fail if it is XPath instead of Playwright CSS/text
+                    syntax, if the element is inside an iframe, if the locator is dynamic, or if the page
+                    changed after load. Prefer short Playwright selectors like `button:has-text('Workflows')`,
+                    `a[href*='workflow']`, `#id`, `[data-testid='...']`, or `input[name='...']`.
+                    Paste only the selector itself, not code like `await page.locator(...)`.
+                  </p>
+                  {manualSelectorStep.provided_selector ? (
+                    <p className={styles.metaLine}>
+                      Last selector tried: {manualSelectorStep.provided_selector}
+                    </p>
+                  ) : null}
+                  {manualSelectorStep.requested_selector_target ? (
+                    <p className={styles.metaLine}>
+                      Needed for: {manualSelectorStep.requested_selector_target}
+                    </p>
+                  ) : null}
+                  <label className={styles.fieldLabel}>
+                    <span>Selector / Locator</span>
+                    <input
+                      value={selectorHelpInput}
+                      onChange={(event) => setSelectorHelpInput(event.target.value)}
+                      placeholder="Example: button:has-text('Workflows')"
+                    />
+                  </label>
+                  <div className={styles.actions}>
+                    <button
+                      type="button"
+                      className={styles.primaryButton}
+                      onClick={submitSelectorHelp}
+                      disabled={isSubmittingSelectorHelp}
+                    >
+                      {isSubmittingSelectorHelp ? "Submitting..." : "Submit Selector And Resume"}
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+
               <div className={styles.timeline}>
                 {currentRun.steps.map((step) => (
                   <article key={step.step_id} className={styles.timelineItem}>
@@ -922,6 +1063,36 @@ export default function Home() {
                         {" "}
                         {currentRun.run_id}
                       </p>
+                    ) : null}
+                    {stepSupportsManualSelectorHelp(step) ? (
+                      <div className={styles.inlineHelpCard}>
+                        <p className={styles.helpTitle}>Selector Needed For This Step</p>
+                        <p className={styles.helpText}>
+                          {step.user_input_prompt ??
+                            "Provide a Playwright selector for the element the agent could not find."}
+                        </p>
+                        {step.requested_selector_target ? (
+                          <p className={styles.metaLine}>Needed for: {step.requested_selector_target}</p>
+                        ) : null}
+                        <label className={styles.fieldLabel}>
+                          <span>Selector / Locator</span>
+                          <input
+                            value={selectorHelpInput}
+                            onChange={(event) => setSelectorHelpInput(event.target.value)}
+                            placeholder="Example: button:has-text('Continue')"
+                          />
+                        </label>
+                        <div className={styles.actions}>
+                          <button
+                            type="button"
+                            className={styles.primaryButton}
+                            onClick={submitSelectorHelp}
+                            disabled={isSubmittingSelectorHelp}
+                          >
+                            {isSubmittingSelectorHelp ? "Submitting..." : "Submit Selector And Resume"}
+                          </button>
+                        </div>
+                      </div>
                     ) : null}
                   </article>
                 ))}
