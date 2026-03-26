@@ -1,4 +1,5 @@
 from __future__ import annotations
+from copy import deepcopy
 from pathlib import Path
 import asyncio
 from html import escape
@@ -6,6 +7,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
+from random import randint
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -14,6 +16,7 @@ from app.brain.base import BrainClient
 from app.config import Settings
 from app.mcp.browser_client import BrowserMCPClient
 from app.mcp.filesystem_client import FileSystemClient
+from app.runtime.instruction_parser import parse_structured_task_steps
 from app.runtime.plan_normalizer import normalize_plan_steps
 from app.runtime.selector_memory import SelectorMemoryStore
 from app.runtime.store import RunStore
@@ -100,6 +103,81 @@ DEFAULT_SELECTOR_PROFILE: dict[str, list[str]] = {
         "text=Sign In",
         "text=Log In",
         "text=Login",
+    ],
+    "sign_up_link": [
+        "a:has-text('Sign up')",
+        "a:has-text('Sign Up')",
+        "button:has-text('Sign up')",
+        "button:has-text('Sign Up')",
+        "[role='link']:has-text('Sign up')",
+        "[role='link']:has-text('Sign Up')",
+        "[role='button']:has-text('Sign up')",
+        "[role='button']:has-text('Sign Up')",
+        "text=Sign up",
+        "text=Sign Up",
+    ],
+    "first_name": [
+        "input[name='firstName']",
+        "input[name='first_name']",
+        "input[id='firstName']",
+        "input[id='first_name']",
+        "input[placeholder*='First name']",
+        "input[placeholder*='First Name']",
+        "input[aria-label*='First name']",
+        "input[aria-label*='First Name']",
+        "label:has-text('First name') input",
+        "label:has-text('First Name') input",
+    ],
+    "last_name": [
+        "input[name='lastName']",
+        "input[name='last_name']",
+        "input[id='lastName']",
+        "input[id='last_name']",
+        "input[placeholder*='Last name']",
+        "input[placeholder*='Last Name']",
+        "input[aria-label*='Last name']",
+        "input[aria-label*='Last Name']",
+        "label:has-text('Last name') input",
+        "label:has-text('Last Name') input",
+    ],
+    "phone_number": [
+        "input[name='phone']",
+        "input[name='phoneNumber']",
+        "input[name='phone_number']",
+        "input[name='mobile']",
+        "input[name='mobileNumber']",
+        "input[id='phone']",
+        "input[id='phoneNumber']",
+        "input[id='mobile']",
+        "input[type='tel']",
+        "input[autocomplete='tel']",
+        "input[placeholder*='Phone']",
+        "input[placeholder*='phone']",
+        "input[placeholder*='Mobile']",
+        "input[placeholder*='mobile']",
+        "input[aria-label*='Phone']",
+        "input[aria-label*='phone']",
+        "input[aria-label*='Mobile']",
+        "input[aria-label*='mobile']",
+        "label:has-text('Phone') input",
+        "label:has-text('Mobile') input",
+    ],
+    "lets_go_button": [
+        "button:has-text(\"Let's go\")",
+        "button:has-text(\"let's go\")",
+        "button:has-text('Lets go')",
+        "[role='button']:has-text(\"Let's go\")",
+        "[role='button']:has-text(\"let's go\")",
+        "text=Let's go",
+        "text=let's go",
+    ],
+    "language_english_option": [
+        ":text-is(\"English\")",
+        "text=English",
+        "[role='option']:has-text('English')",
+        "[role='menuitem']:has-text('English')",
+        "button:has-text('English')",
+        "a:has-text('English')",
     ],
     "language_switcher": [
         "button[aria-label*='language']",
@@ -541,8 +619,10 @@ class AgentExecutor:
 
             has_step_failure = False
             if run.execution_mode == "autonomous" and run.prompt:
+                seeded_structured_steps = self._seed_structured_autonomous_steps(run)
+                structured_prompt_run = bool(run.test_data.get("_structured_prompt_seeded"))
                 has_step_failure = await self._execute_existing_steps(run)
-                if run.status == RunStatus.running and not has_step_failure:
+                if run.status == RunStatus.running and not has_step_failure and not seeded_structured_steps and not structured_prompt_run:
                     generated_failure = await self._execute_autonomous_run(run)
                     has_step_failure = has_step_failure or generated_failure
                 if run.status == RunStatus.waiting_for_input:
@@ -552,12 +632,14 @@ class AgentExecutor:
 
             if run.status == RunStatus.waiting_for_input:
                 preserve_browser_session = True
+            elif self._run_has_manual_selector_recovery(run):
+                preserve_browser_session = True
 
             if run.status == RunStatus.running:
                 run.status = RunStatus.failed if has_step_failure else RunStatus.completed
                 self._run_store.persist(run)
 
-            if run.status != RunStatus.waiting_for_input:
+            if run.status != RunStatus.waiting_for_input and not preserve_browser_session:
                 summary_text = self._build_summary(run)
                 run.summary = await self._brain.summarize(summary_text)
                 await self._files.write_text_artifact(run_id, "summary.txt", run.summary)
@@ -627,6 +709,21 @@ class AgentExecutor:
 
             decision_status = str(decision.get("status", "")).strip().lower()
             if decision_status == "complete":
+                if not run.steps and self._prompt_looks_actionable(run.prompt):
+                    fallback_steps = self._fallback_autonomous_prompt_steps(run.prompt, max_steps)
+                    if fallback_steps:
+                        for step_input in fallback_steps:
+                            step = StepRuntimeState(
+                                index=len(run.steps),
+                                type=str(step_input.get("type", "step")),
+                                input=step_input,
+                                status=StepStatus.pending,
+                            )
+                            run.steps.append(step)
+                        self._run_store.persist(run)
+                        seeded_failure = await self._execute_existing_steps(run)
+                        has_step_failure = has_step_failure or seeded_failure
+                        break
                 summary = str(decision.get("summary", "")).strip()
                 if summary:
                     run.summary = summary
@@ -702,6 +799,7 @@ class AgentExecutor:
             for step in run.steps
             if step.status == StepStatus.completed
         ]
+        matched_previous = self._find_best_previous_successful_run(run)
         previous_successes: list[dict[str, Any]] = []
         for previous in self._run_store.list():
             if previous.run_id == run.run_id:
@@ -735,9 +833,164 @@ class AgentExecutor:
             "current_run_completed_steps": [item for item in completed_steps if item][-8:],
             "previous_successful_runs": previous_successes,
         }
+        if matched_previous:
+            memory["best_matching_successful_run"] = {
+                "run_id": matched_previous.run_id,
+                "prompt": (matched_previous.prompt or "")[:300],
+                "steps": [
+                    item
+                    for item in (
+                        self._step_memory_summary(step)
+                        for step in matched_previous.steps
+                        if step.status == StepStatus.completed
+                    )
+                    if item
+                ][:20],
+            }
         if run.selector_profile:
             memory["selector_profile_keys"] = sorted(run.selector_profile.keys())[:20]
         return memory
+
+    def _fallback_autonomous_prompt_steps(self, prompt: str, max_steps: int) -> list[dict[str, Any]]:
+        parsed_steps = parse_structured_task_steps(
+            prompt,
+            max_steps=max_steps,
+            auto_login_wait_ms=self._settings.auto_login_wait_ms,
+            auto_create_confirm_wait_ms=self._settings.auto_create_confirm_wait_ms,
+            default_wait_ms=self._settings.planner_default_wait_ms,
+            structured_selector_wait_ms=self._settings.structured_selector_wait_ms,
+            structured_options_wait_ms=self._settings.structured_options_wait_ms,
+        )
+        if not parsed_steps:
+            return []
+        return normalize_plan_steps(
+            parsed_steps,
+            max_steps=max_steps,
+            default_wait_ms=self._settings.planner_default_wait_ms,
+        )
+
+    def _seed_structured_autonomous_steps(self, run: RunState) -> bool:
+        if run.steps:
+            return False
+        if self._seed_steps_from_previous_successful_run(run):
+            return True
+        if not self._prompt_looks_actionable(run.prompt):
+            return False
+        seeded_steps = self._fallback_autonomous_prompt_steps(
+            run.prompt,
+            max(int(self._settings.max_steps_per_run), 1),
+        )
+        if not seeded_steps:
+            return False
+        for step_input in seeded_steps:
+            run.steps.append(
+                StepRuntimeState(
+                    index=len(run.steps),
+                    type=str(step_input.get("type", "step")),
+                    input=step_input,
+                    status=StepStatus.pending,
+                )
+            )
+        run.test_data["_structured_prompt_seeded"] = True
+        self._run_store.persist(run)
+        return True
+
+    def _seed_steps_from_previous_successful_run(self, run: RunState) -> bool:
+        target_signature = self._prompt_signature(run.prompt)
+        if not target_signature:
+            return False
+        previous = self._find_best_previous_successful_run(run)
+        if not previous:
+            return False
+        previous_signature = self._prompt_signature(previous.prompt)
+        if self._prompt_similarity_score(target_signature, previous_signature) < 0.995:
+            return False
+        completed_steps = [step for step in previous.steps if step.status == StepStatus.completed]
+        if not completed_steps:
+            return False
+        for previous_step in completed_steps:
+            run.steps.append(
+                StepRuntimeState(
+                    index=len(run.steps),
+                    type=previous_step.type,
+                    input=deepcopy(previous_step.input),
+                    status=StepStatus.pending,
+                )
+            )
+        run.test_data["_structured_prompt_seeded"] = True
+        self._run_store.persist(run)
+        return True
+
+    def _find_best_previous_successful_run(self, run: RunState) -> RunState | None:
+        target_signature = self._prompt_signature(run.prompt)
+        if not target_signature:
+            return None
+        run_domain = self._extract_run_domain(run)
+        best_match: tuple[float, RunState] | None = None
+        for previous in self._run_store.list():
+            if previous.run_id == run.run_id:
+                continue
+            if previous.status != RunStatus.completed:
+                continue
+            if run_domain and self._extract_run_domain(previous) != run_domain:
+                continue
+            previous_signature = self._prompt_signature(previous.prompt)
+            if not previous_signature:
+                continue
+            similarity = self._prompt_similarity_score(target_signature, previous_signature)
+            if similarity < 0.72:
+                continue
+            if best_match is None or similarity > best_match[0]:
+                best_match = (similarity, previous)
+            if similarity >= 0.995:
+                break
+        return best_match[1] if best_match else None
+
+    @staticmethod
+    def _prompt_signature(prompt: str | None) -> str:
+        normalized = " ".join((prompt or "").strip().lower().split())
+        if not normalized:
+            return ""
+        normalized = re.sub(r"\d{8,}", "{number}", normalized)
+        normalized = re.sub(r"\b\d{2,}\b", "{number}", normalized)
+        normalized = normalized.replace("{{now_yyyymmdd_hhmmss}}", "{timestamp}")
+        normalized = normalized.replace("{timestamp}", "{timestamp}")
+        return normalized
+
+    @staticmethod
+    def _prompt_similarity_score(left: str, right: str) -> float:
+        if not left or not right:
+            return 0.0
+        if left == right:
+            return 1.0
+        left_tokens = set(re.findall(r"[a-z0-9_{}']+", left))
+        right_tokens = set(re.findall(r"[a-z0-9_{}']+", right))
+        if not left_tokens or not right_tokens:
+            return 0.0
+        overlap = len(left_tokens & right_tokens)
+        baseline = max(len(left_tokens), len(right_tokens), 1)
+        return overlap / baseline
+
+    @staticmethod
+    def _prompt_looks_actionable(prompt: str) -> bool:
+        text = (prompt or "").strip().lower()
+        if not text:
+            return False
+        action_markers = (
+            "click",
+            "enter ",
+            "type ",
+            "select ",
+            "choose ",
+            "open ",
+            "launch ",
+            "navigate ",
+            "go to ",
+            "wait ",
+            "verify ",
+            "drag ",
+        )
+        return any(marker in text for marker in action_markers)
 
     @staticmethod
     def _step_memory_summary(step: StepRuntimeState) -> dict[str, Any] | None:
@@ -914,17 +1167,28 @@ class AgentExecutor:
         requested_selector = self._requested_selector_target(step)
         if not requested_selector:
             raise ValueError("This step does not support selector input recovery.")
+        selector_value = selector.strip()
+        if not selector_value:
+            raise ValueError("Please provide a non-empty Playwright selector.")
         if step.type == "click":
-            lowered = selector.strip().lower()
+            lowered = selector_value.lower()
             if lowered == "html" or lowered.startswith("html."):
                 raise ValueError(
                     "That selector points to the page root, not the clickable target. "
                     "Please provide the actual button, link, or menu item selector."
                 )
 
-        step.input["selector"] = selector
+        self._remember_selector_success(
+            run_domain=self._extract_run_domain(run),
+            step_type=step.type,
+            raw_selector=requested_selector,
+            resolved_selector=selector_value,
+            text_hint=None,
+        )
+
+        step.input["selector"] = selector_value
         step.input["_selector_help_original"] = requested_selector
-        step.provided_selector = selector
+        step.provided_selector = selector_value
         step.status = StepStatus.pending
         step.started_at = None
         step.ended_at = None
@@ -939,6 +1203,13 @@ class AgentExecutor:
         run.finished_at = None
         self._run_store.persist(run)
         return run
+
+    @classmethod
+    def _run_has_manual_selector_recovery(cls, run: RunState) -> bool:
+        for step in run.steps:
+            if cls._can_accept_manual_selector_hint(step):
+                return True
+        return False
 
     @classmethod
     def _can_accept_manual_selector_hint(cls, step: StepRuntimeState) -> bool:
@@ -1599,6 +1870,8 @@ class AgentExecutor:
                 keys.append("username")
             if "password" in hint_lower:
                 keys.insert(0, "password")
+            if any(token in hint_lower for token in ("+91", "phone", "mobile", "tel")):
+                keys.insert(0, "phone_number")
             if "qa_form" in hint_lower or "form" in hint_lower and "name" in hint_lower:
                 keys.insert(0, "form_name")
             if "qa_auto_workflow" in hint_lower or "workflow" in hint_lower and "name" in hint_lower:
@@ -1617,6 +1890,8 @@ class AgentExecutor:
                 keys.append("username")
             if "password" in selector_lower:
                 keys.insert(0, "password")
+            if any(token in selector_lower for token in ("phone", "mobile", "tel")):
+                keys.insert(0, "phone_number")
             if "username" in selector_lower:
                 keys.insert(0, "username")
             if "formname" in selector_lower or "form_name" in selector_lower or "form name" in selector_lower:
@@ -1768,7 +2043,9 @@ class AgentExecutor:
             candidates.append(selector)
             candidates.extend(self._derive_selector_variants(selector, step_type))
 
-        if step_type == "type":
+        if step_type == "click" and not alias_key and self._prefer_direct_click_selector(selector):
+            deduped = self._dedupe([selector] + candidates)
+        elif step_type == "type" and not alias_key:
             deduped = self._dedupe([selector] + candidates)
         else:
             deduped = self._dedupe(candidates)
@@ -1782,6 +2059,8 @@ class AgentExecutor:
                 effective_filter_key = "email"
             elif "password" in selector_lower:
                 effective_filter_key = "password"
+            elif any(token in selector_lower for token in ("phone", "mobile", "tel")):
+                effective_filter_key = "phone_number"
             elif "dropdown_option_label" in selector_lower:
                 effective_filter_key = "dropdown_option_label"
             elif "dropdown_option_value" in selector_lower:
@@ -1798,6 +2077,7 @@ class AgentExecutor:
         normalized.setdefault("CURRENT_TIMESTAMP", normalized["NOW"])
         normalized.setdefault("NOW_YYYYMMDD_HHMMSS", stable_now.strftime("%Y%m%d_%H%M%S"))
         normalized.setdefault("NOW_YYYYMMDDHHMMSS", stable_now.strftime("%Y%m%d%H%M%S"))
+        normalized.setdefault("RANDOM_PHONE_IN", f"+919{randint(100000000, 999999999)}")
         return normalized
 
     @staticmethod
@@ -1968,7 +2248,80 @@ class AgentExecutor:
             ]
             return filtered or candidates
 
+        if key == "phone_number":
+            preferred_tokens = (
+                "type='tel'",
+                "type=\"tel\"",
+                "autocomplete='tel'",
+                "autocomplete=\"tel\"",
+                "name='phone'",
+                "name=\"phone\"",
+                "name='phonenumber'",
+                "name=\"phonenumber\"",
+                "name='phone_number'",
+                "name=\"phone_number\"",
+                "name='mobile'",
+                "name=\"mobile\"",
+                "id='phone'",
+                "id=\"phone\"",
+                "id='mobile'",
+                "id=\"mobile\"",
+                "placeholder*='phone'",
+                "placeholder*=\"phone\"",
+                "placeholder*='mobile'",
+                "placeholder*=\"mobile\"",
+                "aria-label*='phone'",
+                "aria-label*=\"phone\"",
+                "aria-label*='mobile'",
+                "aria-label*=\"mobile\"",
+            )
+            blocked_tokens = (
+                "#password",
+                "name='password'",
+                "name=\"password\"",
+                "type='password'",
+                "type=\"password\"",
+                "autocomplete='email'",
+                "autocomplete=\"email\"",
+                "name='email'",
+                "name=\"email\"",
+                "placeholder*='email'",
+                "placeholder*=\"email\"",
+            )
+            filtered = [
+                candidate
+                for candidate in candidates
+                if any(token in candidate.lower() for token in preferred_tokens)
+                and not any(token in candidate.lower() for token in blocked_tokens)
+            ]
+            return filtered or [
+                candidate
+                for candidate in candidates
+                if not any(token in candidate.lower() for token in blocked_tokens)
+            ] or candidates
+
         return candidates
+
+    @staticmethod
+    def _prefer_direct_click_selector(selector: str) -> bool:
+        lowered = selector.strip().lower()
+        strong_markers = (
+            "[aria-label",
+            "[data-testid",
+            "[data-test",
+            "[data-qa",
+            "[name=",
+            "[id=",
+            "text=",
+            ":text-is(",
+            ":has-text(",
+            "xpath=",
+            "role=",
+            "placeholder=",
+            "[title*=",
+            "[title=",
+        )
+        return any(marker in lowered for marker in strong_markers)
 
     async def _run_with_drag_fallback(
         self,
@@ -2306,6 +2659,25 @@ class AgentExecutor:
                         f"text={text_value}",
                     ]
                 )
+            checkbox_text_match = re.fullmatch(
+                r"\[role=['\"]checkbox['\"]\]:has-text\((['\"])(.*?)\1\)",
+                selector,
+                re.IGNORECASE,
+            )
+            if checkbox_text_match:
+                text_value = checkbox_text_match.group(2).strip()
+                escaped = self._escape_playwright_text(text_value)
+                variants.extend(
+                    [
+                        f'label:has-text("{escaped}")',
+                        f'label:has-text("{escaped}") input[type="checkbox"]',
+                        f'label:has-text("{escaped}") input[type="radio"]',
+                        f'input[type="checkbox"][aria-label*="{escaped}"]',
+                        f'input[type="radio"][aria-label*="{escaped}"]',
+                        f'[aria-label*="{escaped}"]',
+                        f"text={text_value}",
+                    ]
+                )
             text_link_match = re.fullmatch(r"a:has-text\((['\"])(.*?)\1\)", selector, re.IGNORECASE)
             if text_link_match:
                 text_value = text_link_match.group(2).strip()
@@ -2481,6 +2853,9 @@ class AgentExecutor:
         if upper == "UUID":
             return str(uuid4())
 
+        if upper in {"RANDOM_PHONE_IN", "INDIA_MOBILE", "PHONE_IN"}:
+            return f"+919{randint(100000000, 999999999)}"
+
         if upper.startswith("NOW_"):
             fmt = self._convert_now_format(token[4:])
             if fmt:
@@ -2579,8 +2954,6 @@ class AgentExecutor:
     def _should_request_selector_help(step: StepRuntimeState, exc: Exception) -> bool:
         if step.type not in {"click", "type", "select", "wait", "handle_popup", "verify_text"}:
             return False
-        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-            return step.type == "click"
         message = str(exc).lower()
         selector_failure_markers = (
             "all selector candidates failed",
@@ -2613,8 +2986,8 @@ class AgentExecutor:
             return any(marker in message for marker in click_markers)
         if any(marker in message for marker in selector_failure_markers):
             return True
-        if not any(marker in message for marker in selector_failure_markers):
-            return False
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            return True
         return any(marker in message for marker in actionable_markers)
 
     @staticmethod
@@ -2652,17 +3025,35 @@ class AgentExecutor:
         if not lookup_keys:
             return []
         max_items = max(int(getattr(self._settings, "selector_memory_max_candidates", 5)), 1)
-        candidates: list[str] = []
-        for key_token in lookup_keys:
-            candidates.extend(store.get_candidates(run_domain, step_type, key_token, limit=max_items))
-        filtered = [
-            candidate
-            for candidate in candidates
-            if not self._is_unsafe_memory_selector(candidate)
+        ranked_candidates: list[tuple[int, str]] = []
+        for index, key_token in enumerate(lookup_keys):
+            for candidate in store.get_candidates(run_domain, step_type, key_token, limit=max_items):
+                if self._is_unsafe_memory_selector(candidate):
+                    continue
+                ranked_candidates.append((index, candidate))
+        filtered = self._filter_memory_candidates(
+            step_type,
+            key,
+            [candidate for _, candidate in ranked_candidates],
+        )
+        seen_filtered = set(filtered)
+        prioritized = [
+            (index, candidate)
+            for index, candidate in ranked_candidates
+            if candidate in seen_filtered
         ]
-        filtered = self._filter_memory_candidates(step_type, key, filtered)
-        deduped = self._dedupe(filtered)
-        return sorted(deduped, key=lambda candidate: self._memory_selector_priority(step_type, key, candidate))
+        deduped_prioritized: list[tuple[int, str]] = []
+        seen_candidates: set[str] = set()
+        for index, candidate in prioritized:
+            if candidate in seen_candidates:
+                continue
+            seen_candidates.add(candidate)
+            deduped_prioritized.append((index, candidate))
+        ordered = sorted(
+            deduped_prioritized,
+            key=lambda item: (item[0],) + self._memory_selector_priority(step_type, key, item[1]),
+        )
+        return [candidate for _, candidate in ordered]
 
     def _remember_selector_success(
         self,
@@ -2692,6 +3083,10 @@ class AgentExecutor:
                 keys.extend(["email", "username"])
             if "password" in selector_lower or (text_hint and "password" in text_hint.lower()):
                 keys.append("password")
+            if any(token in selector_lower for token in ("phone", "mobile", "tel")) or (
+                text_hint and any(token in text_hint.lower() for token in ("+91", "phone", "mobile"))
+            ):
+                keys.append("phone_number")
             if "formname" in selector_lower or "form name" in selector_lower or "qa_form" in (text_hint or "").lower():
                 keys.append("form_name")
             if "label" in selector_lower or "first name" in (text_hint or "").lower():
@@ -2804,6 +3199,7 @@ class AgentExecutor:
             return candidates
 
         key_lower = key.strip().lower()
+        key_intent = AgentExecutor._selector_intent_label(key_lower)
         expects_button_like_target = any(
             token in key_lower
             for token in (
@@ -2841,8 +3237,49 @@ class AgentExecutor:
                 continue
             if any(fragment in lowered for fragment in blocked_fragments):
                 continue
+            candidate_intent = AgentExecutor._selector_intent_label(
+                AgentExecutor._extract_selector_text(candidate) or lowered
+            )
+            if key_intent and candidate_intent and not AgentExecutor._selector_intents_compatible(
+                key_intent,
+                candidate_intent,
+            ):
+                continue
             filtered.append(candidate)
         return filtered or candidates
+
+    @staticmethod
+    def _selector_intent_label(text: str) -> str | None:
+        normalized = " ".join(text.strip().lower().split())
+        if not normalized:
+            return None
+        if any(token in normalized for token in ("sign up", "signup", "register", "create account")):
+            return "sign_up"
+        if any(token in normalized for token in ("login", "log in", "sign in", "signin")):
+            return "login"
+        if any(token in normalized for token in ("let's go", "lets go")):
+            return "lets_go"
+        if "english" in normalized:
+            return "english"
+        if re.search(r"\bde\b", normalized) or "deutsch" in normalized or "german" in normalized:
+            return "german_locale"
+        if any(token in normalized for token in ("language", "locale", "lang")):
+            return "language_switcher"
+        if any(token in normalized for token in ("accept", "akzept", "allow all", "cookie", "consent")):
+            return "popup_accept"
+        if any(token in normalized for token in ("cancel", "dismiss", "close", "not now")):
+            return "dismiss"
+        return None
+
+    @staticmethod
+    def _selector_intents_compatible(expected: str, actual: str) -> bool:
+        if expected == actual:
+            return True
+        compatible_groups = (
+            {"language_switcher", "english", "german_locale"},
+            {"popup_accept", "dismiss"},
+        )
+        return any(expected in group and actual in group for group in compatible_groups)
 
     @staticmethod
     def _memory_selector_priority(step_type: str, key: str, selector: str) -> tuple[int, int, int, str]:

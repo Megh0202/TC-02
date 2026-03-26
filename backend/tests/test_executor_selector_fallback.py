@@ -18,6 +18,12 @@ def _executor(step_timeout_seconds: int = 15) -> AgentExecutor:
         selector_recovery_enabled=True,
         selector_recovery_attempts=2,
         selector_recovery_delay_ms=0,
+        max_steps_per_run=30,
+        auto_login_wait_ms=1500,
+        auto_create_confirm_wait_ms=1500,
+        planner_default_wait_ms=1000,
+        structured_selector_wait_ms=6000,
+        structured_options_wait_ms=6000,
     )
     executor._selector_memory = None
     return executor
@@ -34,6 +40,15 @@ class _RunStore:
 
     def persist(self, run: RunState) -> None:
         self._run = run
+
+    def list(self) -> list[RunState]:
+        return [self._run] if self._run is not None else []
+
+    def is_cancelled(self, run_id: str) -> bool:
+        return False
+
+    def clear_cancel(self, run_id: str) -> None:
+        return None
 
 
 def test_selector_candidates_use_default_email_profile() -> None:
@@ -185,6 +200,54 @@ def test_selector_fallback_tries_multiple_candidates() -> None:
     assert attempted[1] == "#username"
 
 
+def test_click_selector_fallback_tries_explicit_selector_before_memory_candidates() -> None:
+    executor = _executor(step_timeout_seconds=6)
+    memory = InMemorySelectorMemoryStore()
+    memory.remember_success(
+        "app.stag.dr-adem.com",
+        "click",
+        "button[aria-label='Change language']",
+        "text=English",
+    )
+    executor._selector_memory = memory
+    attempted: list[str] = []
+
+    async def operation(selector: str) -> str:
+        attempted.append(selector)
+        if selector == "button[aria-label='Change language']":
+            return f"Clicked {selector}"
+        raise ValueError(f"Missing {selector}")
+
+    result = asyncio.run(
+        executor._run_with_selector_fallback(
+            raw_selector="button[aria-label='Change language']",
+            step_type="click",
+            selector_profile={},
+            test_data={},
+            run_domain="app.stag.dr-adem.com",
+            operation=operation,
+        )
+    )
+
+    assert result == "Clicked button[aria-label='Change language']"
+    assert attempted[0] == "button[aria-label='Change language']"
+
+
+def test_checkbox_text_selector_variants_include_label_and_input_fallbacks() -> None:
+    executor = _executor()
+    candidates = executor._selector_candidates(
+        raw_selector="[role='checkbox']:has-text('I confirm that I am 18 years or older.')",
+        step_type="click",
+        selector_profile={},
+        test_data={},
+        run_domain=None,
+    )
+
+    assert 'label:has-text("I confirm that I am 18 years or older.")' in candidates
+    assert 'label:has-text("I confirm that I am 18 years or older.") input[type="checkbox"]' in candidates
+    assert "text=I confirm that I am 18 years or older." in candidates
+
+
 def test_selector_fallback_error_lists_attempts() -> None:
     executor = _executor(step_timeout_seconds=4)
 
@@ -267,7 +330,7 @@ def test_click_selector_parse_error_still_requests_selector_help() -> None:
     assert step.user_input_kind == "selector"
 
 
-def test_execute_type_step_fails_on_plain_timeout_without_selector_resolution_error() -> None:
+def test_execute_type_step_switches_to_waiting_for_input_on_plain_timeout() -> None:
     executor = _executor(step_timeout_seconds=1)
 
     async def _hang(run: RunState, raw_step: dict) -> str:
@@ -290,12 +353,12 @@ def test_execute_type_step_fails_on_plain_timeout_without_selector_resolution_er
 
     asyncio.run(executor._execute_step(run, step))
 
-    assert step.status == StepStatus.failed
-    assert step.user_input_kind is None
-    assert step.requested_selector_target is None
+    assert step.status == StepStatus.waiting_for_input
+    assert step.user_input_kind == "selector"
+    assert step.requested_selector_target == "input[name='email']"
 
 
-def test_apply_manual_selector_hint_updates_step_without_premature_selector_memory() -> None:
+def test_apply_manual_selector_hint_updates_step_and_remembers_selector_for_future_runs() -> None:
     executor = _executor()
     memory = InMemorySelectorMemoryStore()
     run = RunState(
@@ -326,8 +389,177 @@ def test_apply_manual_selector_hint_updates_step_without_premature_selector_memo
     assert step.input["selector"] == "a:has-text('Workflows')"
     assert step.provided_selector == "a:has-text('Workflows')"
     remembered = memory.get_candidates("test.vitaone.io", "click", "button:has-text('Workflows')")
-    assert remembered == []
+    assert remembered == ["a:has-text('Workflows')"]
     assert step.input["_selector_help_original"] == "button:has-text('Workflows')"
+
+
+def test_run_has_manual_selector_recovery_detects_failed_recoverable_step() -> None:
+    step = StepRuntimeState(
+        index=0,
+        type="click",
+        input={"type": "click", "selector": "button:has-text('Login')"},
+        status=StepStatus.failed,
+        error="TimeoutError: locator.click timed out waiting for element",
+    )
+    run = RunState(run_name="selector-recovery-run", steps=[step])
+
+    assert AgentExecutor._run_has_manual_selector_recovery(run) is True
+
+
+def test_seed_structured_autonomous_steps_reuses_previous_successful_run_steps() -> None:
+    executor = _executor()
+    previous = RunState(
+        run_id="previous-run",
+        run_name="previous",
+        start_url="https://app.stag.dr-adem.com/login",
+        prompt="launch app and click login and click sign up",
+        execution_mode="autonomous",
+        status=RunStatus.completed,
+        steps=[
+            StepRuntimeState(
+                index=0,
+                type="navigate",
+                input={"type": "navigate", "url": "https://app.stag.dr-adem.com/login"},
+                status=StepStatus.completed,
+            ),
+            StepRuntimeState(
+                index=1,
+                type="click",
+                input={"type": "click", "selector": "{{selector.login_button}}"},
+                status=StepStatus.completed,
+            ),
+            StepRuntimeState(
+                index=2,
+                type="click",
+                input={"type": "click", "selector": "{{selector.sign_up_link}}"},
+                status=StepStatus.completed,
+            ),
+        ],
+    )
+    current = RunState(
+        run_id="current-run",
+        run_name="current",
+        start_url="https://app.stag.dr-adem.com/login",
+        prompt="launch app and click login and click sign up",
+        execution_mode="autonomous",
+        steps=[],
+    )
+    executor._run_store = _RunStore(previous)
+
+    executor._seed_structured_autonomous_steps(current)
+
+    assert [step.input["selector"] for step in current.steps if "selector" in step.input] == [
+        "{{selector.login_button}}",
+        "{{selector.sign_up_link}}",
+    ]
+    assert all(step.status == StepStatus.pending for step in current.steps)
+
+
+def test_seed_structured_autonomous_steps_keeps_new_prompt_steps_when_prompt_grows() -> None:
+    executor = _executor()
+    previous = RunState(
+        run_id="previous-run",
+        run_name="previous",
+        start_url="https://app.stag.dr-adem.com/login",
+        prompt="launch app and click login and click sign up",
+        execution_mode="autonomous",
+        status=RunStatus.completed,
+        steps=[
+            StepRuntimeState(
+                index=0,
+                type="navigate",
+                input={"type": "navigate", "url": "https://app.stag.dr-adem.com/login"},
+                status=StepStatus.completed,
+            ),
+            StepRuntimeState(
+                index=1,
+                type="click",
+                input={"type": "click", "selector": "{{selector.login_button}}"},
+                status=StepStatus.completed,
+            ),
+            StepRuntimeState(
+                index=2,
+                type="click",
+                input={"type": "click", "selector": "{{selector.sign_up_link}}"},
+                status=StepStatus.completed,
+            ),
+        ],
+    )
+    current = RunState(
+        run_id="current-run",
+        run_name="current",
+        start_url="https://app.stag.dr-adem.com/login",
+        prompt="launch app and click login and click sign up and enter mobile number in the phone number field",
+        execution_mode="autonomous",
+        steps=[],
+    )
+    executor._run_store = _RunStore(previous)
+
+    executor._seed_structured_autonomous_steps(current)
+
+    selectors = [step.input.get("selector") for step in current.steps if "selector" in step.input]
+    assert "{{selector.phone_number}}" in selectors
+    assert selectors != ["{{selector.login_button}}", "{{selector.sign_up_link}}"]
+
+
+def test_initialize_runtime_test_data_adds_stable_random_indian_phone_number() -> None:
+    executor = _executor()
+
+    data = executor._initialize_runtime_test_data({})
+
+    assert re.match(r"^\+919\d{9}$", data["RANDOM_PHONE_IN"])
+    assert executor._apply_template("{{RANDOM_PHONE_IN}}", data) == data["RANDOM_PHONE_IN"]
+
+
+def test_execute_skips_autonomous_brain_after_structured_prompt_steps_are_seeded() -> None:
+    executor = _executor()
+    run = RunState(
+        run_id="run-structured",
+        run_name="structured",
+        prompt="Click on Login\nClick on Cancel",
+        execution_mode="autonomous",
+        steps=[],
+    )
+    executor._run_store = _RunStore(run)
+    async def _start_run(run_id: str) -> None:
+        return None
+
+    async def _close_run(run_id: str) -> None:
+        return None
+
+    async def _write_text_artifact(*args, **kwargs) -> None:
+        return None
+
+    async def _write_bytes_artifact(*args, **kwargs) -> None:
+        return None
+
+    async def _summarize(text: str) -> str:
+        return "summary"
+
+    executor._browser = SimpleNamespace(
+        start_run=_start_run,
+        close_run=_close_run,
+    )
+    executor._files = SimpleNamespace(
+        write_text_artifact=_write_text_artifact,
+        write_bytes_artifact=_write_bytes_artifact,
+    )
+    executor._brain = SimpleNamespace(
+        next_action=lambda **kwargs: (_ for _ in ()).throw(AssertionError("brain should not run")),
+        summarize=_summarize,
+    )
+
+    async def _execute_step(run: RunState, step: StepRuntimeState) -> None:
+        step.status = StepStatus.completed
+        step.message = "completed"
+
+    executor._execute_step = _execute_step
+    executor._write_html_report = lambda run: asyncio.sleep(0)
+
+    asyncio.run(executor.execute("run-structured"))
+
+    assert len(run.steps) == 2
+    assert all(step.status == StepStatus.completed for step in run.steps)
 
 
 def test_selector_variants_include_id_case_and_contains_conversions() -> None:
@@ -566,6 +798,35 @@ def test_selector_memory_prefers_stable_click_selector_over_brittle_css() -> Non
     )
 
     assert candidates[0] == "button:has-text('Login')"
+
+
+def test_selector_memory_prefers_exact_alias_match_over_polluted_text_memory() -> None:
+    executor = _executor()
+    memory = InMemorySelectorMemoryStore()
+    memory.remember_success(
+        "app.stag.dr-adem.com",
+        "click",
+        "sign_up_link",
+        "button:has-text('Sign Up')",
+    )
+    memory.remember_success(
+        "app.stag.dr-adem.com",
+        "click",
+        "text::sign up link",
+        ':text-is("English")',
+    )
+    executor._selector_memory = memory
+
+    candidates = executor._selector_candidates(
+        raw_selector="{{selector.sign_up_link}}",
+        step_type="click",
+        selector_profile={},
+        test_data={},
+        run_domain="app.stag.dr-adem.com",
+    )
+
+    assert candidates[0] == "button:has-text('Sign Up')"
+    assert ':text-is("English")' not in candidates[:3]
 
 
 def test_click_candidate_timeout_is_capped_for_single_candidate() -> None:

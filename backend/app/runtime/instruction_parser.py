@@ -7,7 +7,10 @@ from typing import Any
 _LINE_PREFIX_RE = re.compile(r"^\s*(?:\d+[\).:-]\s*|[-*]\s+)")
 _URL_RE = re.compile(r"https?://[^\s\"'>]+", flags=re.IGNORECASE)
 _QUOTED_RE = re.compile(r"['\"]([^'\"]+)['\"]")
-_TYPE_INTO_RE = re.compile(r"^\s*(?:type|enter)\s+(.+?)\s+into\s+(.+?)\s*$", flags=re.IGNORECASE)
+_TYPE_INTO_RE = re.compile(
+    r"^\s*(?:type|enter|fill|input|provide|write)\s+(.+?)\s+into\s+(.+?)\s*$",
+    flags=re.IGNORECASE,
+)
 _DRAG_TO_RE = re.compile(r"^\s*drag\s+(.+?)\s+to\s+(.+?)\s*$", flags=re.IGNORECASE)
 _CLICK_RE = re.compile(r"^\s*click(?:\s+on)?\s+(.+?)\s*$", flags=re.IGNORECASE)
 _WAIT_MS_RE = re.compile(r"\bwait\s+(\d{2,6})\s*ms\b", flags=re.IGNORECASE)
@@ -221,14 +224,14 @@ def _parse_line(
     if url and any(token in lower for token in ("launch", "open", "navigate", "visit", "go to")):
         return {"type": "navigate", "url": url}
 
-    if any(token in lower for token in ("enter email", "type email", "email -", "email:", "into email", "email field")):
-        value = _after_delimiter(line)
+    if any(token in lower for token in ("enter email", "type email", "fill email", "input email", "provide email", "email -", "email:", "into email", "email field")):
+        value = _extract_email_field_value(line)
         if value:
             return {"type": "type", "selector": "{{selector.email}}", "text": value, "clear_first": True}
 
     if any(
         token in lower
-        for token in ("enter password", "type password", "password -", "password:", "into password", "password field")
+        for token in ("enter password", "type password", "fill password", "input password", "provide password", "password -", "password:", "into password", "password field")
     ):
         value = _after_delimiter(line)
         if value:
@@ -278,6 +281,12 @@ def _parse_line(
 
     if "click" in lower and "new status" in lower and "tab" in lower:
         return {"type": "click", "selector": "{{selector.new_status_tab}}"}
+
+    if "click" in lower and "sign up" in lower:
+        return {"type": "click", "selector": "{{selector.sign_up_link}}"}
+
+    if any(token in lower for token in ("select english from the dropdown", "select english", "choose english")):
+        return {"type": "click", "selector": "{{selector.language_english_option}}"}
 
     if "form name" in lower and any(token in lower for token in ("enter", "type")):
         value = _extract_form_name_value(line)
@@ -419,6 +428,10 @@ def _parse_line(
             "ms": max(structured_options_wait_ms, 0),
         }
 
+    generic_verify = _parse_generic_verify_step(line, structured_selector_wait_ms=structured_selector_wait_ms)
+    if generic_verify is not None:
+        return generic_verify
+
     verify_contains = _parse_verify_contains_on_selector(line)
     if verify_contains is not None:
         return verify_contains
@@ -451,8 +464,30 @@ def _parse_line(
         }
 
     if (
+        any(token in lower for token in ("first name field", "first name"))
+        and _has_type_intent(lower)
+        and not ("value as" in lower and "option" in lower)
+    ):
+        value = quoted or _after_delimiter(line) or "Test"
+        return {"type": "type", "selector": "{{selector.first_name}}", "text": value, "clear_first": True}
+
+    if (
+        any(token in lower for token in ("last name field", "last name"))
+        and _has_type_intent(lower)
+    ):
+        value = quoted or _after_delimiter(line) or "User"
+        return {"type": "type", "selector": "{{selector.last_name}}", "text": value, "clear_first": True}
+
+    if (
+        any(token in lower for token in ("phone number field", "mobile number field", "phone field", "mobile field", "phone number", "mobile number"))
+        and _has_type_intent(lower)
+    ):
+        value = quoted or _after_delimiter(line) or "{{RANDOM_PHONE_IN}}"
+        return {"type": "type", "selector": "{{selector.phone_number}}", "text": value, "clear_first": True}
+
+    if (
         any(token in lower for token in ("label", "lable", "first name"))
-        and any(token in lower for token in ("enter", "type"))
+        and _has_type_intent(lower)
         and not ("value as" in lower and "option" in lower)
     ):
         value = quoted or "First Name"
@@ -460,8 +495,8 @@ def _parse_line(
             return {"type": "type", "selector": "{{selector.dropdown_option_label}}", "text": value, "clear_first": True}
         return {"type": "type", "selector": "{{selector.form_label}}", "text": value, "clear_first": True}
 
-    if any(token in lower for token in ("value as", "enter value", "type value")) and any(
-        token in lower for token in ("enter", "type", "value")
+    if any(token in lower for token in ("value as", "enter value", "type value", "fill value", "input value")) and any(
+        token in lower for token in ("enter", "type", "fill", "input", "provide", "write", "value")
     ):
         value = quoted or _after_delimiter(line) or "A"
         return {"type": "type", "selector": "{{selector.dropdown_option_value}}", "text": value, "clear_first": True}
@@ -485,6 +520,9 @@ def _parse_line(
 
     if "click" in lower and "save" in lower:
         return {"type": "click", "selector": "{{selector.save_form}}"}
+
+    if "click" in lower and ("let's go" in lower or "lets go" in lower):
+        return {"type": "click", "selector": "{{selector.lets_go_button}}"}
 
     if "wait" in lower:
         wait_ms = _extract_wait_ms(line)
@@ -512,6 +550,24 @@ def _after_delimiter(text: str) -> str | None:
     parts = re.split(r"\s[-:]\s", text, maxsplit=1)
     value = parts[1].strip() if len(parts) > 1 else ""
     return value or _first_quoted(text)
+
+
+def _extract_email_field_value(text: str) -> str | None:
+    quoted_values = [match.strip() for match in _QUOTED_RE.findall(text) if match.strip()]
+    if quoted_values:
+        combined = "".join(
+            "{{NOW_YYYYMMDD_HHMMSS}}" if value.strip("{}").lower() == "timestamp" else value
+            for value in quoted_values
+        )
+        if combined:
+            return combined
+    raw = _after_delimiter(text)
+    if not raw:
+        return None
+    normalized = raw.replace("{timestamp}", "{{NOW_YYYYMMDD_HHMMSS}}")
+    normalized = normalized.replace("<timestamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
+    normalized = normalized.replace('+"', "").replace('"+', "")
+    return normalized
 
 
 def _parse_explicit_type(line: str) -> dict[str, Any] | None:
@@ -555,6 +611,12 @@ def _parse_explicit_click(line: str) -> dict[str, Any] | None:
     if not _looks_like_explicit_selector(normalized_target):
         if "log in" in lowered_target or "login" in lowered_target or "sign in" in lowered_target:
             return {"type": "click", "selector": "{{selector.login_button}}"}
+        if "sign up" in lowered_target:
+            return {"type": "click", "selector": "{{selector.sign_up_link}}"}
+        if "let's go" in lowered_target or "lets go" in lowered_target:
+            return {"type": "click", "selector": "{{selector.lets_go_button}}"}
+        if "english" in lowered_target:
+            return {"type": "click", "selector": "{{selector.language_english_option}}"}
         if "create form" in lowered_target:
             return {"type": "click", "selector": "{{selector.create_form}}"}
         if "create workflow" in lowered_target:
@@ -625,6 +687,112 @@ def _strip_wrapping_quotes(text: str) -> str:
 def _normalize_selector_text(text: str) -> str:
     selector = _strip_wrapping_quotes(text).strip().rstrip(".,;")
     return selector
+
+
+def _has_type_intent(lower: str) -> bool:
+    return any(token in lower for token in ("enter", "type", "fill", "input", "provide", "write"))
+
+
+def _has_verify_intent(lower: str) -> bool:
+    return any(token in lower for token in ("verify", "check", "confirm", "assert", "ensure", "validate"))
+
+
+def _parse_generic_verify_step(line: str, *, structured_selector_wait_ms: int) -> dict[str, Any] | None:
+    lower = line.lower()
+    if not _has_verify_intent(lower):
+        return None
+    specialized_markers = (
+        "create form",
+        "create workflow",
+        "transition",
+        "workflow has been created",
+        "workflow saved successfully",
+        "visible in the list",
+        "form editor",
+        "initial_state",
+        "submitted_state",
+        "logged in successfully",
+        "login success",
+    )
+    if any(marker in lower for marker in specialized_markers):
+        return None
+
+    normalized = " ".join(lower.split())
+    hidden_markers = ("not visible", "hidden", "not displayed", "not shown")
+    visible_markers = ("is visible", "should be visible", "visible", "displayed", "shown", "present", "available")
+    target_text = _extract_generic_verify_target(line)
+    if not target_text:
+        return None
+
+    selector = _selector_for_verify_target(target_text)
+    if not selector:
+        return None
+
+    if any(marker in normalized for marker in hidden_markers):
+        return {
+            "type": "wait",
+            "until": "selector_hidden",
+            "selector": selector,
+            "ms": max(structured_selector_wait_ms, 0),
+        }
+
+    if any(marker in normalized for marker in visible_markers):
+        return {
+            "type": "wait",
+            "until": "selector_visible",
+            "selector": selector,
+            "ms": max(structured_selector_wait_ms, 0),
+        }
+
+    return {
+        "type": "verify_text",
+        "selector": selector,
+        "match": "contains",
+        "value": target_text,
+    }
+
+
+def _extract_generic_verify_target(text: str) -> str | None:
+    quoted = _first_quoted(text)
+    if quoted:
+        return quoted
+
+    lowered = text.lower()
+    prefixes = ("verify", "check", "confirm", "assert", "ensure", "validate")
+    target = text.strip()
+    for prefix in prefixes:
+        if lowered.startswith(prefix):
+            target = text[len(prefix):].strip(" :-")
+            break
+
+    target = re.sub(
+        r"\b(is|should be|must be|to be)\s+(visible|displayed|shown|present|available|hidden|not visible|not displayed|not shown)\b.*$",
+        "",
+        target,
+        flags=re.IGNORECASE,
+    ).strip(" .:-")
+    target = re.sub(r"^(that|if)\s+", "", target, flags=re.IGNORECASE).strip()
+    return target or None
+
+
+def _selector_for_verify_target(target: str) -> str | None:
+    lowered = " ".join(target.lower().split())
+    alias_map = (
+        ("create form", "{{selector.create_form}}"),
+        ("create workflow", "{{selector.create_workflow}}"),
+        ("login", "{{selector.login_button}}"),
+        ("sign up", "{{selector.sign_up_link}}"),
+        ("let's go", "{{selector.lets_go_button}}"),
+        ("lets go", "{{selector.lets_go_button}}"),
+        ("workflow has been created", "{{selector.workflow_confirmation}}"),
+        ("save changes", "{{selector.save_changes_button}}"),
+        ("request code now", "text=Request Code now"),
+    )
+    for token, selector in alias_map:
+        if token in lowered:
+            return selector
+    cleaned = target.strip().strip("'\"")
+    return f"text={cleaned}" if cleaned else None
 
 
 def _looks_like_explicit_selector(value: str) -> bool:

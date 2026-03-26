@@ -126,6 +126,31 @@ def test_autonomous_run_accepts_prompt_without_static_steps() -> None:
     assert run["status"] == "completed"
 
 
+def test_autonomous_actionable_prompt_seeds_and_executes_parsed_steps() -> None:
+    payload = {
+        "run_name": "autonomous-structured-run",
+        "prompt": "Click on Login\nClick on Cancel",
+        "execution_mode": "autonomous",
+        "steps": [],
+    }
+
+    with TestClient(app) as client:
+        created = client.post("/api/runs", json=payload)
+        assert created.status_code == 200, created.text
+        run_id = created.json()["run_id"]
+
+        fetched = client.get(f"/api/runs/{run_id}")
+        assert fetched.status_code == 200, fetched.text
+
+    run = fetched.json()
+    assert run["status"] == "completed"
+    assert len(run["steps"]) >= 2
+    assert run["steps"][0]["status"] == "completed"
+    assert run["steps"][1]["status"] == "completed"
+    assert run["steps"][0]["input"]["type"] == "click"
+    assert run["steps"][1]["input"]["type"] == "click"
+
+
 def test_run_generates_html_report_artifact() -> None:
     payload = {
         "run_name": "html-report-run",

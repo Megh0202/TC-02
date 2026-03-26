@@ -318,6 +318,37 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
         except Exception:
             pass
         try:
+            element_info = await locator.evaluate(
+                """
+                (el) => {
+                    if (!(el instanceof Element)) {
+                        return { tag: "", type: "", role: "", inputType: "" };
+                    }
+                    const tag = (el.tagName || "").toLowerCase();
+                    const role = (el.getAttribute("role") || "").toLowerCase();
+                    const inputType = tag === "input" ? ((el.getAttribute("type") || "").toLowerCase()) : "";
+                    return { tag, role, inputType };
+                }
+                """
+            )
+        except Exception:
+            element_info = {"tag": "", "role": "", "inputType": ""}
+        tag_name = str((element_info or {}).get("tag") or "").lower()
+        role_name = str((element_info or {}).get("role") or "").lower()
+        input_type = str((element_info or {}).get("inputType") or "").lower()
+        is_checkbox_like = role_name == "checkbox" or (tag_name == "input" and input_type in {"checkbox", "radio"})
+        if is_checkbox_like:
+            try:
+                await locator.check(timeout=1800, force=True)
+                return f"Clicked {selector}"
+            except Exception:
+                pass
+            try:
+                await locator.set_checked(True, timeout=1800, force=True)
+                return f"Clicked {selector}"
+            except Exception:
+                pass
+        try:
             await locator.scroll_into_view_if_needed(timeout=1200)
         except Exception:
             pass
@@ -355,6 +386,66 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
                 except Exception:
                     pass
                 try:
+                    if is_checkbox_like:
+                        await locator.evaluate(
+                            """
+                            (el) => {
+                                if (!(el instanceof HTMLElement)) {
+                                    throw new Error("Resolved node is not an HTMLElement");
+                                }
+                                const candidate = el.closest("label") || el.parentElement;
+                                if (candidate instanceof HTMLElement) {
+                                    candidate.click();
+                                    return;
+                                }
+                                el.click();
+                            }
+                            """
+                        )
+                        return f"Clicked {selector}"
+                    checkbox_text = ""
+                    checkbox_match = re.search(r":has-text\((['\"])(.*?)\1\)", selector, re.IGNORECASE)
+                    if checkbox_match:
+                        checkbox_text = checkbox_match.group(2).strip()
+                    elif selector_lower.startswith("text="):
+                        checkbox_text = selector.split("=", 1)[1].strip().strip("'\"")
+                    if checkbox_text and ("checkbox" in selector_lower or "radio" in selector_lower):
+                        clicked_by_text = await context.page.evaluate(
+                            """
+                            (text) => {
+                                const normalized = String(text || "").replace(/\\s+/g, " ").trim().toLowerCase();
+                                if (!normalized) return false;
+                                const matches = (value) => String(value || "").replace(/\\s+/g, " ").trim().toLowerCase().includes(normalized);
+                                const labels = Array.from(document.querySelectorAll("label"));
+                                for (const label of labels) {
+                                    if (!matches(label.textContent || "")) continue;
+                                    const nested = label.querySelector("input[type='checkbox'], input[type='radio'], [role='checkbox'], [role='radio']");
+                                    if (nested instanceof HTMLElement) {
+                                        nested.click();
+                                        return true;
+                                    }
+                                    if (label instanceof HTMLElement) {
+                                        label.click();
+                                        return true;
+                                    }
+                                }
+                                const controls = Array.from(document.querySelectorAll("input[type='checkbox'], input[type='radio'], [role='checkbox'], [role='radio']"));
+                                for (const control of controls) {
+                                    const container = control.closest("label, div, span, p") || control.parentElement || control;
+                                    if (matches(container?.textContent || "") || matches(control.getAttribute("aria-label") || "")) {
+                                        if (control instanceof HTMLElement) {
+                                            control.click();
+                                            return true;
+                                        }
+                                    }
+                                }
+                                return false;
+                            }
+                            """,
+                            checkbox_text,
+                        )
+                        if clicked_by_text:
+                            return f"Clicked {selector}"
                     await locator.evaluate(
                         """
                         (el) => {

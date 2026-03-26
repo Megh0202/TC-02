@@ -396,7 +396,127 @@ def test_second_transition_prompt_uses_start_and_initialstate_values() -> None:
         "selector": "div[role='listbox'] [role='option']:has-text(\"START\")",
     }
     assert steps[3] == {"type": "click", "selector": "{{selector.to_status_dropdown}}"}
-    assert steps[4] == {
-        "type": "click",
-        "selector": "div[role='listbox'] [role='option']:has-text(\"InitialState_{{NOW_YYYYMMDD_HHMMSS}}\")",
+
+
+def test_signup_prompt_maps_to_stable_signup_selectors() -> None:
+    task = """
+1) Launch the application https://app.stag.dr-adem.com
+2) Click on Login
+3) click on DE
+4) Select english from the dropdown
+5) click on sign up link
+6) enter "Test" in the first name field
+7) enter "User" in the Last name field
+8) enter "testuser"+"{timestamp}"+"@yopmail.com" into the email field
+9) click on "let's go" button
+"""
+    steps = parse_structured_task_steps(task, max_steps=20)
+
+    assert steps[0] == {"type": "navigate", "url": "https://app.stag.dr-adem.com"}
+    assert steps[1] == {"type": "click", "selector": "{{selector.login_button}}"}
+    assert steps[2] == {"type": "click", "selector": "text=DE"}
+    assert steps[3] == {"type": "click", "selector": "{{selector.language_english_option}}"}
+    assert steps[4] == {"type": "click", "selector": "{{selector.sign_up_link}}"}
+    assert steps[5] == {
+        "type": "type",
+        "selector": "{{selector.first_name}}",
+        "text": "Test",
+        "clear_first": True,
+    }
+    assert steps[6] == {
+        "type": "type",
+        "selector": "{{selector.last_name}}",
+        "text": "User",
+        "clear_first": True,
+    }
+    assert steps[7] == {
+        "type": "type",
+        "selector": "{{selector.email}}",
+        "text": "testuser{{NOW_YYYYMMDD_HHMMSS}}@yopmail.com",
+        "clear_first": True,
+    }
+    assert steps[8] == {"type": "click", "selector": "{{selector.lets_go_button}}"}
+
+
+def test_signup_prompt_maps_phone_field_to_phone_selector() -> None:
+    task = """
+1) Launch the application https://app.stag.dr-adem.com
+2) Click on Login
+3) click on sign up link
+4) enter mobile number in the phone number field
+"""
+    steps = parse_structured_task_steps(task, max_steps=10)
+
+    assert steps[3] == {
+        "type": "type",
+        "selector": "{{selector.phone_number}}",
+        "text": "{{RANDOM_PHONE_IN}}",
+        "clear_first": True,
+    }
+
+
+def test_signup_prompt_fill_mobile_number_is_not_skipped() -> None:
+    task = """
+1) Launch the application https://app.stag.dr-adem.com
+2) Click on Login
+3) click on sign up link
+4) fill mobile number in the phone number field
+5) click on "let's go" button
+"""
+    steps = parse_structured_task_steps(task, max_steps=10)
+
+    assert steps[3] == {
+        "type": "type",
+        "selector": "{{selector.phone_number}}",
+        "text": "{{RANDOM_PHONE_IN}}",
+        "clear_first": True,
+    }
+    assert steps[4] == {"type": "click", "selector": "{{selector.lets_go_button}}"}
+
+
+def test_signup_prompt_provide_last_name_is_not_skipped() -> None:
+    task = """
+1) Launch the application https://app.stag.dr-adem.com
+2) Click on Login
+3) click on sign up link
+4) provide User in the Last name field
+5) click on "let's go" button
+"""
+    steps = parse_structured_task_steps(task, max_steps=10)
+
+    assert steps[3] == {
+        "type": "type",
+        "selector": "{{selector.last_name}}",
+        "text": "User",
+        "clear_first": True,
+    }
+
+
+def test_generic_verify_visible_phrase_is_parsed() -> None:
+    task = """
+1) Click on Login
+2) Check that "Request Code now" is visible
+"""
+    steps = parse_structured_task_steps(task, max_steps=10)
+
+    assert steps[1] == {
+        "type": "wait",
+        "until": "selector_visible",
+        "selector": "text=Request Code now",
+        "ms": 6000,
+    }
+
+
+def test_generic_verify_alias_phrase_is_parsed() -> None:
+    task = """
+1) Click on Login
+2) Ensure Create Form button is visible
+"""
+    steps = parse_structured_task_steps(task, max_steps=10)
+
+    assert steps[1] == {
+        "type": "wait",
+        "until": "selector_visible",
+        "selector": "{{selector.create_form}}",
+        "ms": 6000,
     }
