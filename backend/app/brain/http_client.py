@@ -80,7 +80,7 @@ class HttpBrainClient:
             }
         except Exception:
             url_match = re.search(r"https?://[^\s]+", task)
-            start_url = url_match.group(0) if url_match else "https://example.com"
+            start_url = _clean_url(url_match.group(0)) if url_match else "https://example.com"
             fallback_steps = [
                 {"type": "wait", "until": "load_state", "load_state": "load", "ms": 10000},
                 {"type": "verify_text", "selector": "h1", "match": "contains", "value": "Example"},
@@ -121,3 +121,18 @@ class HttpBrainClient:
             "summary": "Brain unavailable for autonomous next-action planning.",
             "action": None,
         }
+
+
+def _clean_url(url: str) -> str:
+    cleaned = url.strip()
+    trailing_punctuation = {",", ".", ";", ":", "!", "?", ")", "]", "}", "'", '"', "`", ">"}
+    while cleaned:
+        last_char = cleaned[-1]
+        if last_char in trailing_punctuation:
+            cleaned = cleaned[:-1].rstrip()
+            continue
+        if last_char == "/" and len(cleaned) > 1 and cleaned[-2] in trailing_punctuation:
+            cleaned = cleaned[:-1].rstrip()
+            continue
+        break
+    return cleaned

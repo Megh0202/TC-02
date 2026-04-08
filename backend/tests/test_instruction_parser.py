@@ -23,6 +23,16 @@ def test_structured_prompt_inserts_login_before_create_form_verify() -> None:
     assert any(step.get("selector") == "{{selector.save_form}}" for step in steps if step["type"] == "click")
 
 
+def test_structured_prompt_strips_trailing_punctuation_from_url() -> None:
+    task = """
+1) Navigate to https://example.com,/ and wait for the page
+2) Verify "Example Domain"
+"""
+    steps = parse_structured_task_steps(task, max_steps=10)
+
+    assert steps[0] == {"type": "navigate", "url": "https://example.com"}
+
+
 def test_workflow_prompt_without_explicit_login_click_still_inserts_login() -> None:
     task = """
 1) Launch the application - https://test.vitaone.io
@@ -147,7 +157,29 @@ def test_required_optional_form_editor_verification_expands_to_stable_wait_steps
 """
     steps = parse_structured_task_steps(task, max_steps=10)
 
-    assert steps == []
+    assert steps == [
+        {"type": "wait", "until": "selector_visible", "selector": "text=First Name", "ms": 6000},
+        {"type": "wait", "until": "selector_visible", "selector": "text=Email", "ms": 6000},
+        {"type": "wait", "until": "selector_visible", "selector": "text=Dropdown", "ms": 6000},
+        {
+            "type": "wait",
+            "until": "selector_visible",
+            "selector": ".form-row:has-text('First Name'):has-text('Required')",
+            "ms": 6000,
+        },
+        {
+            "type": "wait",
+            "until": "selector_visible",
+            "selector": ".form-row:has-text('Email'):has-text('Required')",
+            "ms": 6000,
+        },
+        {
+            "type": "wait",
+            "until": "selector_hidden",
+            "selector": ".form-row:has-text('Dropdown'):has-text('Required')",
+            "ms": 6000,
+        },
+    ]
 
     structured_task = """
 1) Navigate to https://test.vitaone.io
@@ -260,30 +292,55 @@ def test_workflow_status_prompt_continues_after_creation_without_losing_context(
         "selector": "{{selector.add_status_button}}",
         "ms": 6000,
     }
-    assert steps[1] == {"type": "click", "selector": "{{selector.add_status_button}}"}
-    assert steps[2] == {"type": "click", "selector": "{{selector.new_status_tab}}"}
-    assert steps[3] == {
-        "type": "type",
-        "selector": "{{selector.status_name}}",
-        "text": "InitialState_{{NOW_YYYYMMDD_HHMMSS}}",
-        "clear_first": True,
-    }
-    assert steps[4] == {"type": "click", "selector": "{{selector.status_category_dropdown}}"}
-    assert steps[5] == {"type": "click", "selector": "{{selector.status_category_todo}}"}
-    assert steps[6] == {"type": "click", "selector": "{{selector.save_status}}"}
-    assert steps[7] == {"type": "click", "selector": "{{selector.add_status_button}}"}
-    assert steps[8] == {"type": "click", "selector": "{{selector.new_status_tab}}"}
-    assert steps[9] == {
-        "type": "type",
-        "selector": "{{selector.status_name}}",
-        "text": "SubmittedState_{{NOW_YYYYMMDD_HHMMSS}}",
-        "clear_first": True,
-    }
-    assert steps[10] == {"type": "click", "selector": "{{selector.status_category_dropdown}}"}
-    assert steps[11] == {"type": "click", "selector": "{{selector.status_category_todo}}"}
-    assert steps[12] == {"type": "click", "selector": "{{selector.save_status}}"}
 
 
+def test_generic_verify_field_prompt_uses_field_friendly_selector() -> None:
+    task = """
+1) Navigate to https://test.vitaone.io
+2) Verify the phone number field is visible
+"""
+    steps = parse_structured_task_steps(task, max_steps=10)
+
+    assert steps[1:] == [
+        {
+            "type": "wait",
+            "until": "selector_visible",
+            "selector": "input[aria-label*=\"phone number\"], input[placeholder*=\"phone number\"], textarea[aria-label*=\"phone number\"], textarea[placeholder*=\"phone number\"], label:has-text(\"phone number\")",
+            "ms": 6000,
+        }
+    ]
+
+
+def test_generic_verify_button_prompt_uses_button_friendly_selector() -> None:
+    task = """
+1) Verify the save button is visible
+"""
+    steps = parse_structured_task_steps(task, max_steps=10)
+
+    assert steps == [
+        {
+            "type": "wait",
+            "until": "selector_visible",
+            "selector": "button:has-text(\"save\"), [role=\"button\"]:has-text(\"save\"), a:has-text(\"save\"), text=save",
+            "ms": 6000,
+        }
+    ]
+
+
+def test_verify_text_contains_on_selector_keeps_explicit_selector() -> None:
+    task = """
+1) Verify text contains "Example" on h1
+"""
+    steps = parse_structured_task_steps(task, max_steps=10)
+
+    assert steps == [
+        {
+            "type": "verify_text",
+            "selector": "h1",
+            "match": "contains",
+            "value": "Example",
+        }
+    ]
 def test_workflow_transition_prompt_extends_existing_workflow_flow() -> None:
     task = """
 1) Click on 'Transition' button

@@ -144,7 +144,7 @@ class BrowserMCPClient:
         selector: str | None = None,
         load_state: str | None = None,
     ) -> str:
-        sleep_ms = ms if ms is not None else 700
+        sleep_ms = ms if ms is not None else 500
         await asyncio.sleep(max(sleep_ms, 0) / 1000)
 
         if until == "selector_visible":
@@ -1086,7 +1086,7 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
         page = context.page
 
         if until == "timeout":
-            wait_ms = max(ms if ms is not None else 700, 0)
+            wait_ms = max(ms if ms is not None else 500, 0)
             await page.wait_for_timeout(wait_ms)
             return f"Waited {wait_ms}ms"
 
@@ -1141,13 +1141,52 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
     async def verify_text(self, selector: str, match: str, value: str) -> str:
         context = self._active_context()
         locator = context.page.locator(selector).first
-        text = await locator.text_content()
-        actual = (text or "").strip()
-        if not actual:
-            try:
-                actual = (await locator.inner_text()).strip()
-            except Exception:
-                actual = ""
+        actual = ""
+        try:
+            details = await locator.evaluate(
+                """
+                (el) => {
+                    const norm = (value) => String(value ?? "").replace(/\\s+/g, " ").trim();
+                    const tag = (el.tagName || "").toLowerCase();
+                    const role = norm(el.getAttribute("role")).toLowerCase();
+                    const isField = tag === "input" || tag === "textarea" || tag === "select" || role === "textbox" || role === "combobox";
+                    const fieldValue = (() => {
+                        if (tag === "label") {
+                            const control = el.control || el.querySelector("input, textarea, select, [role='textbox'], [role='combobox']");
+                            if (control) {
+                                const controlValue = norm(control.value ?? control.getAttribute("value") ?? "");
+                                if (controlValue) return controlValue;
+                                const controlLabel = norm(control.getAttribute("aria-label") || control.getAttribute("placeholder") || control.getAttribute("name") || "");
+                                if (controlLabel) return controlLabel;
+                            }
+                        }
+                        if (isField) {
+                            const rawValue = norm(el.value ?? el.getAttribute("value") ?? "");
+                            if (rawValue) return rawValue;
+                        }
+                        return "";
+                    })();
+                    return {
+                        fieldValue,
+                        text: norm(el.textContent),
+                        inner: norm(el.innerText),
+                        aria: norm(el.getAttribute("aria-label")),
+                        name: norm(el.getAttribute("name")),
+                        placeholder: norm(el.getAttribute("placeholder")),
+                    };
+                }
+                """
+            )
+        except Exception:
+            details = {}
+        actual = (
+            str((details or {}).get("fieldValue") or "").strip()
+            or str((details or {}).get("text") or "").strip()
+            or str((details or {}).get("inner") or "").strip()
+            or str((details or {}).get("aria") or "").strip()
+            or str((details or {}).get("name") or "").strip()
+            or str((details or {}).get("placeholder") or "").strip()
+        )
         if not actual:
             for descendant_selector in ("a", "[role='cell']", "td"):
                 try:
@@ -2064,7 +2103,7 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
         context = self._active_context()
 
         if until == "timeout":
-            wait_ms = max(ms if ms is not None else 700, 0)
+            wait_ms = max(ms if ms is not None else 500, 0)
             await self._call_tool(context, "browser_wait_for", {"time": wait_ms / 1000})
             return f"Waited {wait_ms}ms"
 
@@ -2148,11 +2187,37 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             f"  const matchType = {json.dumps(match)};"
             f"  const expected = {json.dumps(value)};"
             "  const locator = page.locator(selector).first();"
-            "  let actual = ((await locator.textContent()) || '').trim();"
-            "  if (!actual) {"
-            "    try { actual = ((await locator.innerText()) || '').trim(); }"
-            "    catch (error) {}"
-            "  }"
+            "  const details = await locator.evaluate((el) => {"
+            "    const norm = (value) => String(value ?? '').replace(/\\s+/g, ' ').trim();"
+            "    const tag = (el.tagName || '').toLowerCase();"
+            "    const role = norm(el.getAttribute('role')).toLowerCase();"
+            "    const isField = tag === 'input' || tag === 'textarea' || tag === 'select' || role === 'textbox' || role === 'combobox';"
+            "    const fieldValue = (() => {"
+            "      if (tag === 'label') {"
+            "        const control = el.control || el.querySelector('input, textarea, select, [role=\"textbox\"], [role=\"combobox\"]');"
+            "        if (control) {"
+            "          const controlValue = norm(control.value ?? control.getAttribute('value') ?? '');"
+            "          if (controlValue) return controlValue;"
+            "          const controlLabel = norm(control.getAttribute('aria-label') || control.getAttribute('placeholder') || control.getAttribute('name') || '');"
+            "          if (controlLabel) return controlLabel;"
+            "        }"
+            "      }"
+            "      if (isField) {"
+            "        const rawValue = norm(el.value ?? el.getAttribute('value') ?? '');"
+            "        if (rawValue) return rawValue;"
+            "      }"
+            "      return '';"
+            "    })();"
+            "    return {"
+            "      fieldValue,"
+            "      text: norm(el.textContent),"
+            "      inner: norm(el.innerText),"
+            "      aria: norm(el.getAttribute('aria-label')),"
+            "      name: norm(el.getAttribute('name')),"
+            "      placeholder: norm(el.getAttribute('placeholder')),"
+            "    };"
+            "  });"
+            "  let actual = details.fieldValue || details.text || details.inner || details.aria || details.name || details.placeholder || '';"
             "  if (!actual) {"
             "    for (const childSelector of ['a', '[role=\"cell\"]', 'td']) {"
             "      try {"

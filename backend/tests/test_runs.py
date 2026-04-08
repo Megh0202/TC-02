@@ -1,4 +1,5 @@
 import os
+import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -297,10 +298,21 @@ def test_selector_submit_retries_blocked_step_immediately() -> None:
 
         assert response.status_code == 200, response.text
         payload = response.json()
-        step = payload["steps"][0]
-        assert step["status"] == "completed"
-        assert step["message"] == "Clicked a:has-text('Workflows')"
-        assert step["failure_screenshot"] is None
-        assert payload["status"] == "completed"
+        assert payload["status"] in {"pending", "running", "completed"}
+
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            fetched = client.get(f"/api/runs/{run.run_id}")
+            assert fetched.status_code == 200, fetched.text
+            payload = fetched.json()
+            step = payload["steps"][0]
+            if step["status"] == "completed":
+                assert step["message"] == "Clicked a:has-text('Workflows')"
+                assert step["failure_screenshot"] is None
+                assert payload["status"] == "completed"
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError(f"Run did not resume in time: {payload}")
     finally:
         executor._dispatch_step = original_dispatch

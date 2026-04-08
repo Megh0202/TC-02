@@ -121,7 +121,7 @@ def _extract_url(text: str) -> str | None:
     match = URL_PATTERN.search(text)
     if not match:
         return None
-    return match.group(0).rstrip(".,)")
+    return _clean_url(match.group(0))
 
 
 def _extract_quoted(text: str) -> str | None:
@@ -130,6 +130,21 @@ def _extract_quoted(text: str) -> str | None:
         return None
     value = match.group(1).strip()
     return value or None
+
+
+def _clean_url(url: str) -> str:
+    cleaned = url.strip()
+    trailing_punctuation = {",", ".", ";", ":", "!", "?", ")", "]", "}", "'", '"', "`", ">"}
+    while cleaned:
+        last_char = cleaned[-1]
+        if last_char in trailing_punctuation:
+            cleaned = cleaned[:-1].rstrip()
+            continue
+        if last_char == "/" and len(cleaned) > 1 and cleaned[-2] in trailing_punctuation:
+            cleaned = cleaned[:-1].rstrip()
+            continue
+        break
+    return cleaned
 
 
 def _extract_value_after_keyword(text: str, keywords: tuple[str, ...]) -> str | None:

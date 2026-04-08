@@ -330,7 +330,61 @@ def test_click_selector_parse_error_still_requests_selector_help() -> None:
     assert step.user_input_kind == "selector"
 
 
-def test_execute_type_step_switches_to_waiting_for_input_on_plain_timeout() -> None:
+def test_click_selector_unable_to_locate_requests_selector_help() -> None:
+    executor = _executor(step_timeout_seconds=4)
+
+    async def _raise_selector_error(run: RunState, raw_step: dict) -> str:
+        raise ValueError("Unable to locate element for selector button:has-text('Workflows')")
+
+    executor._dispatch_step = _raise_selector_error
+    executor._files = SimpleNamespace(
+        write_text_artifact=lambda *args, **kwargs: None,
+        write_bytes_artifact=lambda *args, **kwargs: None,
+    )
+    executor._capture_failure_screenshot = lambda *args, **kwargs: asyncio.sleep(0)
+
+    run = RunState(run_name="selector-help-run", steps=[])
+    step = StepRuntimeState(
+        index=0,
+        type="click",
+        input={"type": "click", "selector": "button:has-text('Workflows')"},
+    )
+
+    asyncio.run(executor._execute_step(run, step))
+
+    assert step.status == StepStatus.waiting_for_input
+    assert step.user_input_kind == "selector"
+
+
+def test_click_timeout_requests_selector_help_instead_of_failing() -> None:
+    executor = _executor(step_timeout_seconds=1)
+
+    async def _hang(run: RunState, raw_step: dict) -> str:
+        await asyncio.sleep(2)
+        return "never"
+
+    executor._dispatch_step = _hang
+    executor._files = SimpleNamespace(
+        write_text_artifact=lambda *args, **kwargs: None,
+        write_bytes_artifact=lambda *args, **kwargs: None,
+    )
+    executor._capture_failure_screenshot = lambda *args, **kwargs: asyncio.sleep(0)
+
+    run = RunState(run_name="selector-help-run", steps=[])
+    step = StepRuntimeState(
+        index=0,
+        type="click",
+        input={"type": "click", "selector": "button:has-text('Workflows')"},
+    )
+
+    asyncio.run(executor._execute_step(run, step))
+
+    assert step.status == StepStatus.waiting_for_input
+    assert step.user_input_kind == "selector"
+    assert "timeout" in (step.error or "").lower()
+
+
+def test_execute_type_step_requests_selector_help_on_plain_timeout() -> None:
     executor = _executor(step_timeout_seconds=1)
 
     async def _hang(run: RunState, raw_step: dict) -> str:
@@ -355,7 +409,36 @@ def test_execute_type_step_switches_to_waiting_for_input_on_plain_timeout() -> N
 
     assert step.status == StepStatus.waiting_for_input
     assert step.user_input_kind == "selector"
-    assert step.requested_selector_target == "input[name='email']"
+    assert "timeout" in (step.error or "").lower()
+
+
+def test_execute_wait_step_still_fails_on_plain_timeout() -> None:
+    executor = _executor(step_timeout_seconds=1)
+
+    async def _hang(run: RunState, raw_step: dict) -> str:
+        await asyncio.sleep(2)
+        return "never"
+
+    executor._dispatch_step = _hang
+    executor._files = SimpleNamespace(
+        write_text_artifact=lambda *args, **kwargs: None,
+        write_bytes_artifact=lambda *args, **kwargs: None,
+    )
+    executor._capture_failure_screenshot = lambda *args, **kwargs: asyncio.sleep(0)
+
+    run = RunState(run_name="selector-help-run", steps=[])
+    step = StepRuntimeState(
+        index=0,
+        type="wait",
+        input={"type": "wait", "until": "timeout", "ms": 1000},
+    )
+
+    asyncio.run(executor._execute_step(run, step))
+
+    assert step.status == StepStatus.failed
+    assert step.user_input_kind is None
+    assert step.requested_selector_target is None
+    assert "timeout" in (step.error or "").lower()
 
 
 def test_apply_manual_selector_hint_updates_step_and_remembers_selector_for_future_runs() -> None:
@@ -391,6 +474,35 @@ def test_apply_manual_selector_hint_updates_step_and_remembers_selector_for_futu
     remembered = memory.get_candidates("test.vitaone.io", "click", "button:has-text('Workflows')")
     assert remembered == ["a:has-text('Workflows')"]
     assert step.input["_selector_help_original"] == "button:has-text('Workflows')"
+
+
+def test_manual_selector_hint_is_kept_in_global_memory_bucket_when_domain_is_missing() -> None:
+    executor = _executor()
+    memory = InMemorySelectorMemoryStore()
+    run = RunState(
+        run_id="run-2",
+        run_name="selector-help-run",
+        status=RunStatus.waiting_for_input,
+        steps=[
+            StepRuntimeState(
+                step_id="step-2",
+                index=0,
+                type="click",
+                input={"type": "click", "selector": "button:has-text('Continue')"},
+                status=StepStatus.waiting_for_input,
+                user_input_kind="selector",
+                requested_selector_target="button:has-text('Continue')",
+            )
+        ],
+    )
+    executor._run_store = _RunStore(run)
+    executor._selector_memory = memory
+
+    executor.apply_manual_selector_hint("run-2", "step-2", "a:has-text('Continue')")
+
+    assert memory.get_candidates("", "click", "button:has-text('Continue')") == [
+        "a:has-text('Continue')"
+    ]
 
 
 def test_run_has_manual_selector_recovery_detects_failed_recoverable_step() -> None:
@@ -560,6 +672,44 @@ def test_execute_skips_autonomous_brain_after_structured_prompt_steps_are_seeded
 
     assert len(run.steps) == 2
     assert all(step.status == StepStatus.completed for step in run.steps)
+
+
+def test_autonomous_run_stops_if_next_action_is_not_prompt_grounded() -> None:
+    executor = _executor()
+    run = RunState(
+        run_id="run-autonomous",
+        run_name="autonomous",
+        prompt="Launch the application and login.",
+        execution_mode="autonomous",
+        steps=[],
+    )
+    executor._run_store = _RunStore(run)
+    executor._browser = SimpleNamespace(
+        start_run=lambda run_id: asyncio.sleep(0),
+        close_run=lambda run_id: asyncio.sleep(0),
+        inspect_page=lambda: asyncio.sleep(0, result={"interactive_elements": [], "text_excerpt": ""}),
+    )
+    executor._files = SimpleNamespace(
+        write_text_artifact=lambda *args, **kwargs: asyncio.sleep(0),
+        write_bytes_artifact=lambda *args, **kwargs: asyncio.sleep(0),
+    )
+    executor._brain = SimpleNamespace(
+        next_action=lambda **kwargs: asyncio.sleep(
+            0,
+            result={
+                "status": "action",
+                "action": {"type": "click", "selector": "text=Send link again"},
+            },
+        ),
+        summarize=lambda text: asyncio.sleep(0, result="summary"),
+    )
+
+    result = asyncio.run(executor._execute_autonomous_run(run))
+
+    assert result is False
+    assert run.status == RunStatus.completed
+    assert run.summary == "Autonomous mode stopped because the next action was not grounded in the prompt."
+    assert run.steps == []
 
 
 def test_selector_variants_include_id_case_and_contains_conversions() -> None:
@@ -832,7 +982,7 @@ def test_selector_memory_prefers_exact_alias_match_over_polluted_text_memory() -
 def test_click_candidate_timeout_is_capped_for_single_candidate() -> None:
     executor = _executor(step_timeout_seconds=60)
 
-    assert executor._candidate_timeout_seconds(1, step_type="click") == 8.0
+    assert executor._candidate_timeout_seconds(1, step_type="click") == 5.0
 
 
 def test_click_memory_candidates_exclude_form_fields_for_button_like_targets() -> None:

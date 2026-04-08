@@ -51,12 +51,13 @@ class AnthropicProvider:
 
         text = await self._create_message(
             system_prompt=(
-                "You are a web automation planner. "
+                "You are a web automation planner for any application or website. "
                 "Return ONLY strict JSON with keys: run_name, start_url, steps. "
                 "steps must use types: navigate, click, type, select, drag, scroll, wait, "
                 "handle_popup, verify_text, verify_image. "
-                "Cover every explicit user instruction in order when max_steps allows. "
-                "Do not invent extra requirements not present in the task."
+                "Cover every explicit user instruction in order when max_steps allows, even for long prompts. "
+                "Do not invent extra requirements not present in the task. "
+                "Prefer the smallest reliable step sequence and avoid unnecessary waits."
             ),
             user_content=(
                 f"Task: {task}\n"
@@ -116,7 +117,7 @@ class AnthropicProvider:
 
         text = await self._create_message_with_blocks(
             system_prompt=(
-                "You are a browser automation agent. "
+                "You are a browser automation agent for any application or website. "
                 "Return ONLY strict JSON with keys: status, summary, action. "
                 "status must be 'action' or 'complete'. "
                 "If status is 'action', action must contain exactly one supported runtime step using one of: "
@@ -125,12 +126,13 @@ class AnthropicProvider:
                 "Treat history as authoritative progress already completed. "
                 "Continue the user's remaining instructions in order and do not repeat finished steps. "
                 "Use memory from previous successful runs and previously proven selectors when it is relevant to the current page/domain. "
-                "Do not stop early if explicit prompt steps remain unfinished. "
+                "Do not stop early if explicit prompt steps remain unfinished, even for long multi-step prompts. "
                 "Do not invent unrelated navigation or extra checks unless needed to unblock the next explicit instruction. "
                 "When page.interactive_elements include selectors, prefer reusing those selectors directly. "
                 "Use the screenshot as visual evidence when DOM data is ambiguous. "
                 "Do not ask the user for selector help unless the action is impossible to infer from the page state. "
                 "Prefer stable Playwright selectors using id, name, label, role, data-testid, or text selectors. "
+                "Move quickly: avoid unnecessary pauses or exploratory clicks when a direct supported action is available. "
                 "Do not return markdown or explanations outside JSON."
             ),
             user_blocks=user_blocks,
@@ -275,7 +277,7 @@ class AnthropicProvider:
     @staticmethod
     def _fallback_plan(task: str, max_steps: int) -> dict[str, Any]:
         url_match = re.search(r"https?://[^\s]+", task)
-        start_url = url_match.group(0) if url_match else "https://example.com"
+        start_url = _clean_url(url_match.group(0)) if url_match else "https://example.com"
         steps = [
             {"type": "wait", "until": "load_state", "load_state": "load", "ms": 10000},
             {"type": "verify_text", "selector": "h1", "match": "contains", "value": "Example"},
@@ -332,3 +334,18 @@ class AnthropicProvider:
                 steps = [image_step]
 
         return steps
+
+
+def _clean_url(url: str) -> str:
+    cleaned = url.strip()
+    trailing_punctuation = {",", ".", ";", ":", "!", "?", ")", "]", "}", "'", '"', "`", ">"}
+    while cleaned:
+        last_char = cleaned[-1]
+        if last_char in trailing_punctuation:
+            cleaned = cleaned[:-1].rstrip()
+            continue
+        if last_char == "/" and len(cleaned) > 1 and cleaned[-2] in trailing_punctuation:
+            cleaned = cleaned[:-1].rstrip()
+            continue
+        break
+    return cleaned

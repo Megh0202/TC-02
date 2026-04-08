@@ -66,7 +66,7 @@ def _normalize_step(raw_step: dict[str, Any]) -> dict[str, Any] | None:
         )
         if not url:
             return None
-        return {"type": "navigate", "url": url}
+        return {"type": "navigate", "url": _clean_url(url)}
 
     if step_type == "click":
         selector = _pick_selector(raw_step)
@@ -479,7 +479,7 @@ def _extract_url(text: str) -> str | None:
     match = re.search(r"https?://[^\s\"']+", text)
     if not match:
         return None
-    return match.group(0).rstrip(".,)")
+    return _clean_url(match.group(0))
 
 
 def _extract_quoted_text(text: str) -> str | None:
@@ -497,6 +497,21 @@ def _as_str(value: Any) -> str | None:
         text = _normalize_unicode_quotes(value).strip()
         return text if text else None
     return _normalize_unicode_quotes(str(value)).strip() or None
+
+
+def _clean_url(url: str) -> str:
+    cleaned = url.strip()
+    trailing_punctuation = {",", ".", ";", ":", "!", "?", ")", "]", "}", "'", '"', "`", ">"}
+    while cleaned:
+        last_char = cleaned[-1]
+        if last_char in trailing_punctuation:
+            cleaned = cleaned[:-1].rstrip()
+            continue
+        if last_char == "/" and len(cleaned) > 1 and cleaned[-2] in trailing_punctuation:
+            cleaned = cleaned[:-1].rstrip()
+            continue
+        break
+    return cleaned
 
 
 def _normalize_unicode_quotes(text: str) -> str:

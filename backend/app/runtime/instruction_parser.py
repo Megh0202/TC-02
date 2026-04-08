@@ -40,7 +40,7 @@ def parse_structured_task_steps(
         if not line:
             continue
         instruction_lines.extend(_split_compound_actions(line))
-    if len(instruction_lines) < 2:
+    if not instruction_lines:
         return []
 
     steps: list[dict[str, Any]] = []
@@ -543,7 +543,7 @@ def _extract_url(text: str) -> str | None:
     match = _URL_RE.search(text)
     if not match:
         return None
-    return match.group(0).rstrip(".,)")
+    return _clean_url(match.group(0))
 
 
 def _after_delimiter(text: str) -> str | None:
@@ -701,6 +701,8 @@ def _parse_generic_verify_step(line: str, *, structured_selector_wait_ms: int) -
     lower = line.lower()
     if not _has_verify_intent(lower):
         return None
+    if _VERIFY_CONTAINS_ON_RE.match(line):
+        return None
     specialized_markers = (
         "create form",
         "create workflow",
@@ -791,6 +793,50 @@ def _selector_for_verify_target(target: str) -> str | None:
     for token, selector in alias_map:
         if token in lowered:
             return selector
+
+    button_context = any(
+        token in lowered
+        for token in (
+            "button",
+            "link",
+            "tab",
+            "item",
+            "menu",
+            "option",
+        )
+    )
+    if button_context:
+        button_text = re.sub(
+            r"\b(button|link|tab|item|menu|option)\b\s*$",
+            "",
+            target,
+            flags=re.IGNORECASE,
+        ).strip(" .:-")
+        button_text = re.sub(r"^(the|a|an|this|that)\s+", "", button_text, flags=re.IGNORECASE).strip()
+        if button_text and button_text.lower() not in {"the", "a", "an", "this", "that"}:
+            escaped = button_text.replace('"', '\\"')
+            return (
+                f'button:has-text("{escaped}"), '
+                f'[role="button"]:has-text("{escaped}"), '
+                f'a:has-text("{escaped}"), '
+                f'text={escaped}'
+            )
+
+    field_context = any(
+        token in lowered
+        for token in ("field", "textbox", "input", "placeholder", "label", "phone", "mobile", "email", "password", "username", "name")
+    )
+    field_like = re.sub(r"\b(field|textbox|input)\b", "", lowered).strip(" .:-")
+    field_like = re.sub(r"^(the|a|an|this|that)\s+", "", field_like).strip()
+    if field_context and field_like and field_like not in {"the", "a", "an", "this", "that"}:
+        escaped = field_like.replace('"', '\\"')
+        return (
+            f'input[aria-label*="{escaped}"], '
+            f'input[placeholder*="{escaped}"], '
+            f'textarea[aria-label*="{escaped}"], '
+            f'textarea[placeholder*="{escaped}"], '
+            f'label:has-text("{escaped}")'
+        )
     cleaned = target.strip().strip("'\"")
     return f"text={cleaned}" if cleaned else None
 
@@ -932,6 +978,21 @@ def _extract_drag_field_label(text: str) -> str | None:
         if label:
             return " ".join(part.capitalize() for part in label.split())
     return None
+
+
+def _clean_url(url: str) -> str:
+    cleaned = url.strip()
+    trailing_punctuation = {",", ".", ";", ":", "!", "?", ")", "]", "}", "'", '"', "`", ">"}
+    while cleaned:
+        last_char = cleaned[-1]
+        if last_char in trailing_punctuation:
+            cleaned = cleaned[:-1].rstrip()
+            continue
+        if last_char == "/" and len(cleaned) > 1 and cleaned[-2] in trailing_punctuation:
+            cleaned = cleaned[:-1].rstrip()
+            continue
+        break
+    return cleaned
 
 
 def _drag_source_selector_from_label(label: str | None) -> str:

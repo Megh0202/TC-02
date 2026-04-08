@@ -74,11 +74,12 @@ class LocalVLLMProvider:
                 {
                     "role": "system",
                     "content": (
-                        "You are a web automation planner. "
+                        "You are a web automation planner for any application or website. "
                         "Return ONLY strict JSON with keys: run_name, start_url, steps. "
                         "steps must be an array of action objects using only types: "
                         "navigate, click, type, select, scroll, wait, handle_popup, verify_text, verify_image. "
-                        "Use concise reliable selectors. Keep plan short and safe."
+                        "Cover every explicit user instruction in order when max_steps allows, even for long prompts. "
+                        "Use concise reliable selectors. Keep the plan short, safe, and avoid unnecessary waits."
                     ),
                 },
                 {
@@ -133,10 +134,12 @@ class LocalVLLMProvider:
                 {
                     "role": "system",
                     "content": (
-                        "You are a browser automation agent. "
+                        "You are a browser automation agent for any application or website. "
                         "Return ONLY strict JSON with keys: status, summary, action. "
                         "status must be 'action' or 'complete'. "
-                        "If status='action', action must be a single supported runtime step object."
+                        "If status='action', action must be a single supported runtime step object. "
+                        "Do not stop early if explicit prompt steps remain unfinished. "
+                        "Move quickly and avoid unnecessary exploratory actions."
                     ),
                 },
                 {
@@ -257,7 +260,7 @@ class LocalVLLMProvider:
     @staticmethod
     def _fallback_plan(task: str, max_steps: int) -> dict[str, Any]:
         url_match = re.search(r"https?://[^\s]+", task)
-        start_url = url_match.group(0) if url_match else "https://example.com"
+        start_url = _clean_url(url_match.group(0)) if url_match else "https://example.com"
         steps = [
             {"type": "wait", "until": "load_state", "load_state": "load", "ms": 10000},
             {"type": "verify_text", "selector": "h1", "match": "contains", "value": "Example"},
@@ -314,3 +317,18 @@ class LocalVLLMProvider:
                 steps = [image_step]
 
         return steps
+
+
+def _clean_url(url: str) -> str:
+    cleaned = url.strip()
+    trailing_punctuation = {",", ".", ";", ":", "!", "?", ")", "]", "}", "'", '"', "`", ">"}
+    while cleaned:
+        last_char = cleaned[-1]
+        if last_char in trailing_punctuation:
+            cleaned = cleaned[:-1].rstrip()
+            continue
+        if last_char == "/" and len(cleaned) > 1 and cleaned[-2] in trailing_punctuation:
+            cleaned = cleaned[:-1].rstrip()
+            continue
+        break
+    return cleaned

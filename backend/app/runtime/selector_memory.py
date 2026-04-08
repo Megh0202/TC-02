@@ -26,6 +26,11 @@ def _normalize_token(value: str) -> str:
     return " ".join(value.strip().lower().split())
 
 
+def _normalize_domain_token(value: str) -> str:
+    token = _normalize_token(value)
+    return token if token else "__global__"
+
+
 @dataclass
 class _MemoryItem:
     selector: str
@@ -38,7 +43,7 @@ class InMemorySelectorMemoryStore:
         self._entries: dict[tuple[str, str, str], dict[str, _MemoryItem]] = {}
 
     def remember_success(self, domain: str, step_type: str, key: str, selector: str) -> None:
-        domain_token = _normalize_token(domain)
+        domain_token = _normalize_domain_token(domain)
         step_token = _normalize_token(step_type)
         key_token = _normalize_token(key)
         selector_token = selector.strip()
@@ -55,7 +60,7 @@ class InMemorySelectorMemoryStore:
                 existing.score += 1
 
     def get_candidates(self, domain: str, step_type: str, key: str, limit: int = 5) -> list[str]:
-        domain_token = _normalize_token(domain)
+        domain_token = _normalize_domain_token(domain)
         step_token = _normalize_token(step_type)
         key_token = _normalize_token(key)
         if not (domain_token and step_token and key_token):
@@ -103,14 +108,14 @@ class SqliteSelectorMemoryStore(InMemorySelectorMemoryStore):
                 "SELECT domain, step_type, key, selector, score FROM selector_memory"
             ).fetchall()
         for domain, step_type, key, selector, score in rows:
-            lookup = (_normalize_token(domain), _normalize_token(step_type), _normalize_token(key))
+            lookup = (_normalize_domain_token(domain), _normalize_token(step_type), _normalize_token(key))
             slot = self._entries.setdefault(lookup, {})
             slot[selector] = _MemoryItem(selector=selector, score=max(int(score), 1))
 
     def remember_success(self, domain: str, step_type: str, key: str, selector: str) -> None:
         super().remember_success(domain, step_type, key, selector)
 
-        domain_token = _normalize_token(domain)
+        domain_token = _normalize_domain_token(domain)
         step_token = _normalize_token(step_type)
         key_token = _normalize_token(key)
         selector_token = selector.strip()

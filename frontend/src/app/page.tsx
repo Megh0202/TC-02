@@ -200,7 +200,7 @@ function stepSupportsManualSelectorHelp(step: RuntimeStep): boolean {
   if (step.status !== "failed") {
     return false;
   }
-  if (!["click", "type", "select", "wait", "handle_popup", "verify_text"].includes(step.type)) {
+  if (!["click", "type", "select", "wait", "handle_popup", "verify_text", "scroll", "verify_image"].includes(step.type)) {
     return false;
   }
   const message = `${step.error ?? ""} ${step.message ?? ""}`.toLowerCase();
@@ -229,6 +229,10 @@ function stepSupportsManualSelectorHelp(step: RuntimeStep): boolean {
     "resolved to 0 elements",
     "blocked=",
     "in_iframe=",
+    "unable to locate",
+    "cannot find",
+    "could not find",
+    "no such element",
   ];
   return recoverableMarkers.some((marker) => message.includes(marker));
 }
@@ -286,15 +290,8 @@ export default function Home() {
     }
     return SHOW_ADVANCED_INPUTS ? planPreview : null;
   }, [importedPlan, planPreview]);
-  const waitingStep = useMemo(
-    () =>
-      currentRun?.steps.find(
-        (step) => step.status === "waiting_for_input" && step.user_input_kind === "selector",
-      ) ?? null,
-    [currentRun],
-  );
   const manualSelectorStep = useMemo(
-    () => currentRun?.steps.find((step) => stepSupportsManualSelectorHelp(step)) ?? null,
+    () => [...(currentRun?.steps ?? [])].reverse().find((step) => stepSupportsManualSelectorHelp(step)) ?? null,
     [currentRun],
   );
 

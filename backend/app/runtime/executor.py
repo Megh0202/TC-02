@@ -602,6 +602,7 @@ class AgentExecutor:
 
         is_new_run = run.started_at is None
         run.test_data = self._initialize_runtime_test_data(run.test_data or {})
+        run.test_data.setdefault("_popup_scan_needed", True)
         run.status = RunStatus.running
         if is_new_run:
             run.started_at = utc_now()
@@ -730,6 +731,12 @@ class AgentExecutor:
                 break
 
             raw_action = decision.get("action")
+            if not self._action_is_prompt_grounded(run.prompt, raw_action):
+                run.status = RunStatus.completed
+                if not run.summary:
+                    run.summary = "Autonomous mode stopped because the next action was not grounded in the prompt."
+                self._run_store.persist(run)
+                break
             normalized_steps = normalize_plan_steps(
                 [raw_action],
                 max_steps=1,
@@ -993,6 +1000,86 @@ class AgentExecutor:
         return any(marker in text for marker in action_markers)
 
     @staticmethod
+    def _action_is_prompt_grounded(prompt: str, action: Any) -> bool:
+        prompt_text = " ".join((prompt or "").lower().split())
+        if not prompt_text:
+            return True
+        if not isinstance(action, dict):
+            return False
+
+        tokens = set(re.findall(r"[a-z0-9]+", prompt_text))
+        prompt_terms = {
+            token
+            for token in tokens
+            if len(token) >= 4
+            and token
+            not in {
+                "click",
+                "enter",
+                "type",
+                "fill",
+                "input",
+                "open",
+                "launch",
+                "navigate",
+                "visit",
+                "select",
+                "choose",
+                "verify",
+                "check",
+                "confirm",
+                "ensure",
+                "that",
+                "with",
+                "from",
+                "into",
+                "this",
+                "then",
+                "page",
+                "step",
+                "button",
+                "link",
+                "field",
+                "form",
+                "screen",
+                "the",
+                "and",
+                "for",
+                "you",
+                "your",
+                "now",
+            }
+        }
+        if not prompt_terms:
+            return True
+
+        action_text = " ".join(
+            str(value)
+            for value in action.values()
+            if isinstance(value, (str, int, float, bool))
+        ).lower()
+        action_terms = set(re.findall(r"[a-z0-9]+", action_text))
+        if not action_terms:
+            return False
+
+        if action.get("type") == "navigate":
+            return True
+
+        overlap = prompt_terms & action_terms
+        if overlap:
+            return True
+
+        explicit_selectors = (
+            str(action.get("selector", "")),
+            str(action.get("source_selector", "")),
+            str(action.get("target_selector", "")),
+        )
+        if any(term in prompt_text for term in explicit_selectors if term):
+            return True
+
+        return False
+
+    @staticmethod
     def _step_memory_summary(step: StepRuntimeState) -> dict[str, Any] | None:
         payload: dict[str, Any] = {
             "type": step.type,
@@ -1069,10 +1156,23 @@ class AgentExecutor:
             )
         except Exception as exc:
             compact = self._compact_error(exc)
-            if self._should_request_selector_help(step, exc):
+            # Check if this is a selector-related error and we should try automated recovery
+            # BUT: if the user already provided a selector (step.provided_selector), don't try recovery again
+            # Just fail so the user knows the selector they provided didn't work
+            if self._is_selector_error(step, exc) and self._should_attempt_automated_recovery(step, exc) and not step.provided_selector:
+                # Try to get the original selector that failed
+                original_selector = step.input.get("selector", "unknown")
+                
+                # Try to find a better selector using all automated methods
+                if await self._attempt_automated_selector_recovery(run, step, original_selector):
+                    # Retry the step with the new selector
+                    await self._execute_step(run, step)
+                    return
+                
+                # If automated recovery still fails, ask the user
                 step.status = StepStatus.waiting_for_input
                 step.error = compact
-                step.message = "Waiting for selector help"
+                step.message = "Could not find selector automatically. Please provide one."
                 step.user_input_kind = "selector"
                 step.requested_selector_target = self._requested_selector_target(step)
                 step.user_input_prompt = self._build_selector_help_prompt(step)
@@ -1083,15 +1183,21 @@ class AgentExecutor:
                 else:
                     step.error = compact
                 step.message = "Step failed"
+                if step.provided_selector:
+                    step.message = f"Step failed with the selector you provided: {step.provided_selector}"
                 await self._capture_failure_screenshot(run.run_id, step)
         finally:
             step.ended_at = utc_now()
 
     async def _auto_handle_known_popups(self, run: RunState) -> None:
+        if not bool(run.test_data.get("_popup_scan_needed", True)):
+            return
         try:
             snapshot = await self._browser.inspect_page()
         except Exception:
+            run.test_data["_popup_scan_needed"] = False
             return
+        run.test_data["_popup_scan_needed"] = False
         if not self._looks_like_popup_blocker(snapshot):
             return
 
@@ -1217,7 +1323,7 @@ class AgentExecutor:
             return step.user_input_kind == "selector"
         if step.status != StepStatus.failed:
             return False
-        if step.type not in {"click", "type", "select", "wait", "handle_popup", "verify_text"}:
+        if step.type not in {"click", "type", "select", "wait", "handle_popup", "verify_text", "scroll", "verify_image"}:
             return False
         error_text = str(step.error or step.message or "").strip()
         if not error_text:
@@ -1247,7 +1353,9 @@ class AgentExecutor:
 
         if step_type == "navigate":
             target_url = self._apply_template(str(raw_step["url"]), test_data)
-            return await self._browser.navigate(target_url)
+            result = await self._browser.navigate(target_url)
+            run.test_data["_popup_scan_needed"] = True
+            return result
 
         if step_type == "click":
             selector = str(raw_step["selector"])
@@ -1735,45 +1843,74 @@ class AgentExecutor:
             str(item.get("placeholder", "")),
             str(item.get("href", "")),
             str(item.get("title", "")),
+            str(item.get("class", "")),
         ]
         haystack = " ".join(part.lower() for part in haystack_parts if part).strip()
         if not haystack:
             return 0
 
         score = 0
+        # Base score for term matches
         for term in target_terms:
             if term in haystack:
-                score += max(8, len(term))
+                score += max(10, len(term) * 2)  # Higher base score
 
         tag = str(item.get("tag", "")).lower()
         role = str(item.get("role", "")).lower()
+        item_id = str(item.get("id", "")).strip()
+        testid = str(item.get("testid", "")).strip()
+        name = str(item.get("name", "")).strip()
+        aria = str(item.get("aria", "")).strip()
+
+        # Specificity bonuses
+        if item_id:
+            score += 25  # IDs are very specific
+        if testid:
+            score += 20  # Test IDs are reliable
+        if name and tag in {"input", "textarea", "select"}:
+            score += 15  # Named form elements are good
+        if aria:
+            score += 12  # Aria labels are accessible and specific
+
+        # Step type specific bonuses
         if step_type in {"type", "select"}:
             if tag in {"input", "textarea", "select"}:
-                score += 12
-            if role in {"textbox", "combobox"}:
-                score += 8
+                score += 15
+            if role in {"textbox", "combobox", "listbox"}:
+                score += 10
+            # Bonus for form-related attributes
+            if name or aria or item_id:
+                score += 5
         elif step_type in {"click", "handle_popup"}:
-            if tag in {"button", "a"}:
-                score += 12
+            if tag in {"button", "a", "input"} and str(item.get("type", "")).lower() in {"submit", "button"}:
+                score += 15
             if role in {"button", "link", "menuitem", "tab", "combobox"}:
+                score += 10
+            # Interactive elements get bonus
+            if tag in {"button", "a", "select"} or role in {"button", "link"}:
                 score += 8
         elif step_type in {"wait", "verify_text"}:
-            score += 4
+            score += 5  # General bonus for visibility checks
 
+        # Language/language selector bonus
         language_intent = any(term in {"language", "locale", "lang"} for term in target_terms)
         if language_intent:
             text_value = str(item.get("text", "")).strip()
             uppercase_code = len(text_value) <= 5 and text_value.isupper()
             if any(token in haystack for token in ("language", "locale", "lang")):
-                score += 20
+                score += 25
             if tag in {"button", "select"}:
-                score += 10
+                score += 12
             if role in {"button", "combobox", "menuitem"}:
-                score += 10
+                score += 12
             if uppercase_code:
-                score += 14
+                score += 18
 
-        return score
+        # Penalize generic elements that are less likely to be the target
+        if tag in {"div", "span", "p"} and not (item_id or testid or aria):
+            score -= 5
+
+        return max(0, score)  # Ensure non-negative score
 
     def _selectors_from_snapshot_item(self, item: dict[str, Any], step_type: str) -> list[str]:
         selectors: list[str] = []
@@ -1786,36 +1923,96 @@ class AgentExecutor:
         placeholder = str(item.get("placeholder", "")).strip()
         text = str(item.get("text", "")).strip()
         title = str(item.get("title", "")).strip()
+        classes = str(item.get("class", "")).strip()
 
+        # ID-based selectors (most specific)
         if item_id:
             selectors.append(f"#{item_id}")
+            if tag:
+                selectors.append(f"{tag}#{item_id}")
+
+        # Test ID selectors
         if testid:
             selectors.append(f'[data-testid="{self._escape_playwright_text(testid)}"]')
+            selectors.append(f'[data-testid*="{self._escape_playwright_text(testid)}"]')
+
+        # Name-based selectors
         if name and tag in {"input", "textarea", "select"}:
             selectors.append(f'{tag}[name="{self._escape_playwright_text(name)}"]')
+            selectors.append(f'[name="{self._escape_playwright_text(name)}"]')
+
+        # Class-based selectors
+        if classes:
+            class_list = classes.split()
+            if class_list:
+                # Single class
+                selectors.append(f".{class_list[0]}")
+                if tag:
+                    selectors.append(f"{tag}.{class_list[0]}")
+                # Multiple classes for specificity
+                if len(class_list) > 1:
+                    combined = ".".join(class_list[:2])
+                    selectors.append(f".{combined}")
+                    if tag:
+                        selectors.append(f"{tag}.{combined}")
+
+        # Aria label selectors
         if aria:
             escaped_aria = self._escape_playwright_text(aria[:60])
+            selectors.append(f'[aria-label*="{escaped_aria}"]')
+            selectors.append(f'[aria-label="{escaped_aria}"]')
             if tag:
                 selectors.append(f'{tag}[aria-label*="{escaped_aria}"]')
             if role:
                 selectors.append(f'[role="{self._escape_playwright_text(role)}"][aria-label*="{escaped_aria}"]')
-            selectors.append(f'[aria-label*="{escaped_aria}"]')
+
+        # Title selectors
         if title:
-            selectors.append(f'[title*="{self._escape_playwright_text(title[:60])}"]')
+            escaped_title = self._escape_playwright_text(title[:60])
+            selectors.append(f'[title*="{escaped_title}"]')
+            selectors.append(f'[title="{escaped_title}"]')
+
+        # Placeholder selectors
         if placeholder and tag in {"input", "textarea"}:
-            selectors.append(f'{tag}[placeholder*="{self._escape_playwright_text(placeholder[:60])}"]')
+            escaped_placeholder = self._escape_playwright_text(placeholder[:60])
+            selectors.append(f'{tag}[placeholder*="{escaped_placeholder}"]')
+            selectors.append(f'{tag}[placeholder="{escaped_placeholder}"]')
+            selectors.append(f'[placeholder*="{escaped_placeholder}"]')
+
+        # Text-based selectors
         if text:
             escaped_text = self._escape_playwright_text(text[:80])
             if step_type in {"click", "handle_popup"}:
                 if tag == "button":
                     selectors.append(f'button:has-text("{escaped_text}")')
+                    selectors.append(f'button:text-is("{escaped_text}")')
                 elif tag == "select":
                     selectors.append(f'select:has-text("{escaped_text}")')
                 elif tag == "a":
                     selectors.append(f'a:has-text("{escaped_text}")')
+                    selectors.append(f'a:text-is("{escaped_text}")')
                 elif role:
                     selectors.append(f'[role="{self._escape_playwright_text(role)}"]:has-text("{escaped_text}")')
+                    selectors.append(f'[role="{self._escape_playwright_text(role)}"]:text-is("{escaped_text}")')
+                # Generic text selectors
+                selectors.append(f':has-text("{escaped_text}")')
+                selectors.append(f':text-is("{escaped_text}")')
             selectors.append(f"text={text[:80]}")
+
+            # Partial text matches for longer text
+            if len(text) > 10:
+                partial_text = text[:15] + "..."
+                selectors.append(f"text={partial_text}")
+
+        # Role-based selectors
+        if role:
+            selectors.append(f'[role="{self._escape_playwright_text(role)}"]')
+            if tag:
+                selectors.append(f'{tag}[role="{self._escape_playwright_text(role)}"]')
+
+        # Tag-only selectors (least specific, but sometimes useful)
+        if tag and not any(tag in s for s in selectors):
+            selectors.append(tag)
 
         return self._dedupe(selectors)
 
@@ -1823,16 +2020,20 @@ class AgentExecutor:
         step_timeout = max(float(self._settings.step_timeout_seconds), 1.0)
         if candidate_count <= 1:
             if step_type == "type":
-                return min(step_timeout, 6.0)
+                return min(step_timeout, 4.0)
             if step_type == "click":
-                return min(step_timeout, 8.0)
-            return step_timeout
+                return min(step_timeout, 5.0)
+            if step_type == "select":
+                return min(step_timeout, 4.5)
+            return min(step_timeout, 6.0)
         budget = max(step_timeout - 0.5, 1.0)
         per_candidate = budget / candidate_count
         if step_type == "type":
-            per_candidate = min(per_candidate, 4.0)
+            per_candidate = min(per_candidate, 3.0)
         if step_type == "click":
-            per_candidate = min(per_candidate, 5.0)
+            per_candidate = min(per_candidate, 4.0)
+        if step_type == "select":
+            per_candidate = min(per_candidate, 4.0)
         return max(min(per_candidate, step_timeout), 1.0)
 
     def _selector_candidates(
@@ -2043,9 +2244,10 @@ class AgentExecutor:
             candidates.append(selector)
             candidates.extend(self._derive_selector_variants(selector, step_type))
 
-        if step_type == "click" and not alias_key and self._prefer_direct_click_selector(selector):
-            deduped = self._dedupe([selector] + candidates)
-        elif step_type == "type" and not alias_key:
+        # Always prioritize direct selectors (non-templates) for click and type operations
+        # This ensures user-provided selectors are tried first
+        if not alias_key and step_type in ("click", "type"):
+            # For direct (non-template) selectors, try them first
             deduped = self._dedupe([selector] + candidates)
         else:
             deduped = self._dedupe(candidates)
@@ -2625,6 +2827,7 @@ class AgentExecutor:
     def _derive_selector_variants(self, selector: str, step_type: str) -> list[str]:
         variants: list[str] = []
 
+        # Convert :contains() to :has-text()
         contains_match = re.search(r":contains\((['\"])(.*?)\1\)", selector)
         if contains_match:
             contains_text = contains_match.group(2).strip()
@@ -2640,12 +2843,19 @@ class AgentExecutor:
 
         variants.extend(self._id_case_variants(selector))
 
+        # Remove nth-child selectors that might be too specific
         if ":first-child" in selector:
             variants.append(selector.replace(":first-child", ""))
         if ":nth-child(1)" in selector:
             variants.append(selector.replace(":nth-child(1)", ""))
+        if ":nth-child(2)" in selector:
+            variants.append(selector.replace(":nth-child(2)", ":first-child"))
+        if ":last-child" in selector:
+            variants.append(selector.replace(":last-child", ""))
 
         selector_lower = selector.lower()
+
+        # Enhanced button/link variants
         if step_type == "click":
             text_button_match = re.fullmatch(r"button:has-text\((['\"])(.*?)\1\)", selector, re.IGNORECASE)
             if text_button_match:
@@ -2655,10 +2865,15 @@ class AgentExecutor:
                     [
                         f'a:has-text("{escaped}")',
                         f'[role="button"]:has-text("{escaped}")',
+                        f'[role="link"]:has-text("{escaped}")',
                         f':text-is("{escaped}")',
                         f"text={text_value}",
+                        f'input[type="submit"][value*="{escaped}"]',
+                        f'input[type="button"][value*="{escaped}"]',
                     ]
                 )
+
+            # Checkbox/radio variants
             checkbox_text_match = re.fullmatch(
                 r"\[role=['\"]checkbox['\"]\]:has-text\((['\"])(.*?)\1\)",
                 selector,
@@ -2678,6 +2893,8 @@ class AgentExecutor:
                         f"text={text_value}",
                     ]
                 )
+
+            # Link variants
             text_link_match = re.fullmatch(r"a:has-text\((['\"])(.*?)\1\)", selector, re.IGNORECASE)
             if text_link_match:
                 text_value = text_link_match.group(2).strip()
@@ -2686,10 +2903,13 @@ class AgentExecutor:
                     [
                         f'button:has-text("{escaped}")',
                         f'[role="button"]:has-text("{escaped}")',
+                        f'[role="link"]:has-text("{escaped}")',
                         f':text-is("{escaped}")',
                         f"text={text_value}",
                     ]
                 )
+
+            # Aria button variants
             aria_button_match = re.fullmatch(
                 r"button\[aria-label=(['\"])(.*?)\1\]",
                 selector,
@@ -2703,17 +2923,45 @@ class AgentExecutor:
                         f'[aria-label*="{escaped}"]',
                         f'[role="button"][aria-label*="{escaped}"]',
                         f'button[title*="{escaped}"]',
+                        f'[title*="{escaped}"]',
                     ]
                 )
                 if any(token in aria_value.lower() for token in ("language", "locale", "lang")):
                     variants.extend(self._merge_profile_candidates("language_switcher", {}))
 
+        # Input field variants
+        if step_type == "type":
+            placeholder_match = re.search(r'placeholder=(["\'])(.*?)\1', selector)
+            if placeholder_match:
+                placeholder_text = placeholder_match.group(2).strip()
+                escaped = self._escape_playwright_text(placeholder_text)
+                variants.extend([
+                    f'input[placeholder*="{escaped}"]',
+                    f'textarea[placeholder*="{escaped}"]',
+                    f'[placeholder*="{escaped}"]',
+                    f'[aria-label*="{escaped}"]',
+                ])
+
+            name_match = re.search(r'name=(["\'])(.*?)\1', selector)
+            if name_match:
+                name_value = name_match.group(2).strip()
+                escaped = self._escape_playwright_text(name_value)
+                variants.extend([
+                    f'input[name="{escaped}"]',
+                    f'textarea[name="{escaped}"]',
+                    f'select[name="{escaped}"]',
+                    f'[name="{escaped}"]',
+                ])
+
+        # Amazon-specific patterns
         if "s-main-slot" in selector_lower or "s-search-result" in selector_lower:
             variants.extend(
                 [
                     "div[data-component-type='s-search-result'] h2 a",
                     "h2 a.a-link-normal",
                     "h2 a",
+                    ".a-link-normal",
+                    "[data-cy='title-recipe'] a",
                 ]
             )
         if "h2 a:visible" in selector_lower:
@@ -2722,8 +2970,24 @@ class AgentExecutor:
                     "div[data-component-type='s-search-result'] h2 a",
                     "h2 a.a-link-normal",
                     "h2 a",
+                    ".a-link-normal",
                 ]
             )
+
+        # Generic text-based fallbacks
+        text_match = re.search(r':has-text\((["\'])(.*?)\1\)', selector)
+        if text_match and step_type in {"click", "verify_text"}:
+            text_value = text_match.group(2).strip()
+            variants.append(f"text={text_value}")
+
+        # Remove overly specific selectors that might break
+        if ">>>" in selector:
+            # Split complex selectors and try parts
+            parts = selector.split(">>>")
+            for part in parts:
+                part = part.strip()
+                if part and len(part) > 3:
+                    variants.append(part)
 
         return self._dedupe(variants)
 
@@ -2905,6 +3169,136 @@ class AgentExecutor:
                 return existing_value
         return None
 
+    def _is_selector_error(self, step: StepRuntimeState, error: Exception | None) -> bool:
+        """Check if the error is selector-related."""
+        if not error:
+            return False
+        error_text = self._compact_error(error).lower()
+        # Check for common selector-related errors
+        selector_error_markers = (
+            "no element matches",
+            "selector did not resolve",
+            "element is not visible",
+            "element is not attached",
+            "element is outside",
+            "element is obscured",
+            "could not find element",
+            "unable to find",
+            "not found",
+            "selector error",
+        )
+        return any(marker in error_text for marker in selector_error_markers)
+
+    def _should_attempt_automated_recovery(self, step: StepRuntimeState, error: Exception | None) -> bool:
+        """Check if we should attempt automated selector recovery before asking user."""
+        if step.type not in {"click", "type", "select", "wait", "verify_text", "handle_popup"}:
+            return False
+        if not self._is_selector_error(step, error):
+            return False
+        return True
+
+    async def _attempt_automated_selector_recovery(
+        self,
+        run: RunState,
+        step: StepRuntimeState,
+        original_selector: str,
+    ) -> bool:
+        """
+        Try to automatically recover by finding a better selector.
+        Returns True if a new selector was found and set on the step.
+        """
+        run_domain = self._extract_run_domain(run)
+        selector_profile = run.selector_profile or {}
+        test_data = run.test_data or {}
+        step_type = step.type
+        text_hint = step.input.get("text_hint")
+
+        # 1. First try selector memory (highest priority - previous successes)
+        memory_candidates = self._memory_candidates(run_domain, step_type, original_selector)
+        if memory_candidates:
+            LOGGER.info(f"Automated recovery: Trying {len(memory_candidates)} memory candidates")
+            for candidate in memory_candidates:
+                if await self._test_selector(candidate, step_type):
+                    step.input["selector"] = candidate
+                    LOGGER.info(f"Automated recovery SUCCESS with memory selector: {candidate}")
+                    return True
+
+        # 2. Try live page inspection for new candidates not yet tried
+        try:
+            live_candidates = await self._live_page_selector_candidates(
+                raw_selector=original_selector,
+                step_type=step_type,
+                text_hint=text_hint,
+            )
+            if live_candidates:
+                LOGGER.info(f"Automated recovery: Trying {len(live_candidates)} live page candidates")
+                for candidate in live_candidates:
+                    if await self._test_selector(candidate, step_type):
+                        step.input["selector"] = candidate
+                        # Remember this success for future runs
+                        self._remember_selector_success(
+                            run_domain=run_domain,
+                            step_type=step_type,
+                            raw_selector=original_selector,
+                            resolved_selector=candidate,
+                            text_hint=text_hint,
+                        )
+                        LOGGER.info(f"Automated recovery SUCCESS with live page selector: {candidate}")
+                        return True
+        except Exception as e:
+            LOGGER.debug(f"Live page inspection failed during recovery: {e}")
+
+        # 3. Try selector variants as last resort automated approach
+        try:
+            variants = self._derive_selector_variants(original_selector, step_type)
+            if variants:
+                LOGGER.info(f"Automated recovery: Trying {len(variants)} selector variants")
+                for variant in variants:
+                    if await self._test_selector(variant, step_type):
+                        step.input["selector"] = variant
+                        LOGGER.info(f"Automated recovery SUCCESS with variant selector: {variant}")
+                        return True
+        except Exception as e:
+            LOGGER.debug(f"Variant generation failed during recovery: {e}")
+
+        LOGGER.warning(f"Automated recovery failed for selector: {original_selector}")
+        return False
+
+    async def _test_selector(self, selector: str, step_type: str, timeout_s: float = 3.0) -> bool:
+        """
+        Quick test if a selector works on the current page.
+        Returns True if selector can be found and is reasonably accessible.
+        """
+        try:
+            if step_type in {"click", "type", "select", "handle_popup"}:
+                # Try a quick focus/visibility check
+                result = await asyncio.wait_for(
+                    self._browser.wait_for(
+                        until="selector_visible",
+                        ms=int(timeout_s * 1000),
+                        selector=selector,
+                        load_state=None,
+                    ),
+                    timeout=timeout_s + 1,
+                )
+                return bool(result)
+            elif step_type in {"wait", "verify_text"}:
+                # For wait/verify, just check if it's visible
+                result = await asyncio.wait_for(
+                    self._browser.wait_for(
+                        until="selector_visible",
+                        ms=int(timeout_s * 1000),
+                        selector=selector,
+                        load_state=None,
+                    ),
+                    timeout=timeout_s + 1,
+                )
+                return bool(result)
+        except (asyncio.TimeoutError, TimeoutError, Exception):
+            return False
+
+        return False
+
     @staticmethod
     def _dedupe(values: list[str]) -> list[str]:
         ordered: list[str] = []
@@ -2952,43 +3346,55 @@ class AgentExecutor:
 
     @staticmethod
     def _should_request_selector_help(step: StepRuntimeState, exc: Exception) -> bool:
-        if step.type not in {"click", "type", "select", "wait", "handle_popup", "verify_text"}:
+        if step.type not in {"click", "type", "select", "wait", "handle_popup", "verify_text", "scroll", "verify_image"}:
             return False
         message = str(exc).lower()
+        if "invalid regex pattern" in message or "invalid regular expression" in message:
+            return False
         selector_failure_markers = (
             "all selector candidates failed",
             "no valid selector candidates",
             "no selector candidates available",
         )
         actionable_markers = (
-            "timeout",
-            "waiting for",
             "locator.",
             "element",
             "not found",
             "not visible",
+            "unable to locate",
+            "cannot find",
+            "could not find",
+            "no such element",
             "strict mode violation",
             "would receive the click",
             "unexpected token",
             "parsing css selector",
+            "resolved to 0 elements",
+            "not attached",
+            "not in the dom",
+            "selector",
+            "missing selector",
         )
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            if step.type == "wait":
+                until = str(step.input.get("until", "timeout")).lower()
+                if until == "timeout":
+                    return False
+            return step.type in {"click", "type", "select", "handle_popup", "scroll", "verify_text", "verify_image"}
         if step.type == "click":
             click_markers = selector_failure_markers + actionable_markers + (
-                "click failed for",
                 "locator.click",
-                "not attached",
-                "intercept",
                 "another element would receive the click",
-                "resolved to 0 elements",
-                "blocked=",
-                "in_iframe=",
             )
             return any(marker in message for marker in click_markers)
         if any(marker in message for marker in selector_failure_markers):
             return True
-        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-            return True
-        return any(marker in message for marker in actionable_markers)
+        if step.type == "wait":
+            until = str(step.input.get("until", "timeout")).lower()
+            if until == "timeout":
+                return False
+        timeout_markers = ("timeout", "waiting for")
+        return any(marker in message for marker in actionable_markers + timeout_markers)
 
     @staticmethod
     def _requested_selector_target(step: StepRuntimeState) -> str | None:
@@ -3017,7 +3423,7 @@ class AgentExecutor:
 
     def _memory_candidates(self, run_domain: str | None, step_type: str, key: str) -> list[str]:
         store = self._selector_memory
-        if not store or not run_domain:
+        if not store:
             return []
         lookup_keys = self._selector_memory_lookup_keys(key)
         lookup_keys.extend(self._semantic_selector_memory_keys(step_type, key))
@@ -3026,11 +3432,15 @@ class AgentExecutor:
             return []
         max_items = max(int(getattr(self._settings, "selector_memory_max_candidates", 5)), 1)
         ranked_candidates: list[tuple[int, str]] = []
-        for index, key_token in enumerate(lookup_keys):
-            for candidate in store.get_candidates(run_domain, step_type, key_token, limit=max_items):
-                if self._is_unsafe_memory_selector(candidate):
-                    continue
-                ranked_candidates.append((index, candidate))
+        lookup_domains = [run_domain] if run_domain else []
+        lookup_domains.append(None)
+        for domain_index, domain_token in enumerate(lookup_domains):
+            domain_value = domain_token or ""
+            for index, key_token in enumerate(lookup_keys):
+                for candidate in store.get_candidates(domain_value, step_type, key_token, limit=max_items):
+                    if self._is_unsafe_memory_selector(candidate):
+                        continue
+                    ranked_candidates.append((domain_index + index, candidate))
         filtered = self._filter_memory_candidates(
             step_type,
             key,
@@ -3065,7 +3475,7 @@ class AgentExecutor:
         text_hint: str | None,
     ) -> None:
         store = self._selector_memory
-        if not store or not run_domain:
+        if not store:
             return
         if self._is_unsafe_memory_selector(resolved_selector):
             return
@@ -3131,8 +3541,10 @@ class AgentExecutor:
             ):
                 keys.append("form_canvas_target")
 
-        for key in self._dedupe(keys):
-            store.remember_success(run_domain, step_type, key, resolved_selector)
+        domains = [run_domain or "", "__global__"]
+        for domain in self._dedupe(domains):
+            for key in self._dedupe(keys):
+                store.remember_success(domain, step_type, key, resolved_selector)
 
     @staticmethod
     def _selector_memory_lookup_keys(key: str) -> list[str]:
@@ -3158,10 +3570,48 @@ class AgentExecutor:
         if not normalized:
             return []
 
-        return [
+        keys = [
             f"text::{normalized}",
             f"{step_type}::text::{normalized}",
         ]
+
+        # Add word-based keys for better matching
+        words = normalized.split()
+        if len(words) > 1:
+            # Add individual words
+            for word in words:
+                if len(word) >= 3:  # Only meaningful words
+                    keys.extend([
+                        f"text::{word}",
+                        f"{step_type}::text::{word}",
+                    ])
+
+            # Add first two words for phrase matching
+            if len(words) >= 2:
+                first_two = " ".join(words[:2])
+                keys.extend([
+                    f"text::{first_two}",
+                    f"{step_type}::text::{first_two}",
+                ])
+
+        # Add partial matches for common patterns
+        if len(normalized) > 10:
+            # Add first 10 characters for prefix matching
+            prefix = normalized[:10]
+            keys.extend([
+                f"text::{prefix}*",
+                f"{step_type}::text::{prefix}*",
+            ])
+
+        # Add lowercase version without spaces for exact matching
+        compact = normalized.replace(" ", "")
+        if compact != normalized and len(compact) >= 3:
+            keys.extend([
+                f"text::{compact}",
+                f"{step_type}::text::{compact}",
+            ])
+
+        return self._dedupe(keys)
 
     @staticmethod
     def _extract_selector_text(selector: str) -> str | None:

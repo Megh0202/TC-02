@@ -78,6 +78,16 @@ def test_build_recovery_steps_with_url() -> None:
     assert steps[0]["url"] == "https://example.com"
 
 
+def test_build_recovery_steps_strips_trailing_punctuation_from_url() -> None:
+    steps = build_recovery_steps(
+        "Open https://example.com,/ and continue",
+        max_steps=10,
+    )
+
+    assert steps[0]["type"] == "navigate"
+    assert steps[0]["url"] == "https://example.com"
+
+
 def test_normalize_smart_quotes_in_selector() -> None:
     steps = normalize_plan_steps(
         [

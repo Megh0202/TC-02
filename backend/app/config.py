@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000"
     admin_api_token: str = ""
 
-    max_steps_per_run: int = 300
+    max_steps_per_run: int = 500
     step_timeout_seconds: int = 60
     drag_step_timeout_seconds: int = 120
     browser_mode: Literal["mock", "playwright", "mcp"] = "mock"
@@ -51,17 +51,17 @@ class Settings(BaseSettings):
     selector_memory_db_path: Path = Path("data/selector_memory.sqlite3")
     selector_memory_max_candidates: int = 5
     selector_recovery_enabled: bool = True
-    selector_recovery_attempts: int = 2
-    selector_recovery_delay_ms: int = 350
+    selector_recovery_attempts: int = 1
+    selector_recovery_delay_ms: int = 0
     auto_drag_pre_click_enabled: bool = True
-    auto_drag_post_wait_ms: int = 120
-    auto_login_wait_ms: int = 500
-    auto_create_confirm_wait_ms: int = 450
-    default_wait_ms: int = 450
-    planner_default_wait_ms: int = 1000
+    auto_drag_post_wait_ms: int = 100
+    auto_login_wait_ms: int = 350
+    auto_create_confirm_wait_ms: int = 300
+    default_wait_ms: int = 350
+    planner_default_wait_ms: int = 700
     recovery_load_state_wait_ms: int = 10000
-    structured_selector_wait_ms: int = 6000
-    structured_options_wait_ms: int = 5000
+    structured_selector_wait_ms: int = 4500
+    structured_options_wait_ms: int = 3500
 
     filesystem_mode: Literal["local", "mcp"] = "local"
     file_mcp_command: str = "npx"

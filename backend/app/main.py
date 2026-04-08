@@ -525,6 +525,7 @@ def build_app() -> FastAPI:
             "- Keep action order aligned to the prompt; do not verify post-login controls before login actions complete.\n"
             "- For login pages, prefer '#username' or input[name='username'] for username/email fields,\n"
             "  and '#password' or input[name='password'] for password fields if present.\n"
+            "- Prefer stable selectors already known from selector_profile or previous successful runs; only fall back to manual selector help when no reliable selector can be derived from the current page.\n"
         )
 
         if request.test_data:
@@ -637,6 +638,7 @@ def build_app() -> FastAPI:
         run_id: str,
         step_id: str,
         request: StepSelectorHelpRequest,
+        background_tasks: BackgroundTasks,
         _: None = Depends(require_admin_auth),
     ) -> RunState:
         try:
@@ -645,7 +647,7 @@ def build_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not run:
             raise HTTPException(status_code=404, detail="Run or step not found")
-        await executor.execute(run_id)
+        background_tasks.add_task(executor.execute, run_id)
         resumed = run_store.get(run_id)
         if not resumed:
             raise HTTPException(status_code=404, detail="Run not found after resume")
